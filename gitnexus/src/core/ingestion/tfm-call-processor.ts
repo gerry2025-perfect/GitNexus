@@ -120,7 +120,7 @@ export async function processTfmCalls(
 }
 
 /**
- * Scan all roots for tfm_service/*.xml files and parse them
+ * Scan all roots for tfm_service and subdirectories for XML files
  */
 async function buildServiceMap(roots: string[]): Promise<Map<string, ExtractedTfmServiceDef>> {
   const serviceMap = new Map<string, ExtractedTfmServiceDef>();
@@ -136,17 +136,14 @@ async function buildServiceMap(roots: string[]): Promise<Map<string, ExtractedTf
       continue; // tfm_service directory doesn't exist in this root
     }
 
-    const xmlFiles = await fs.promises.readdir(tfmDir);
+    // Recursively scan all XML files in tfm_service and subdirectories
+    const xmlFiles = await scanXmlFiles(tfmDir);
 
-    for (const xmlFile of xmlFiles) {
-      if (!xmlFile.endsWith('.xml')) continue;
-
-      const serviceName = xmlFile.replace('.xml', '');
+    for (const xmlPath of xmlFiles) {
+      const serviceName = path.basename(xmlPath, '.xml');
 
       // Skip if already found in higher-priority root
       if (serviceMap.has(serviceName)) continue;
-
-      const xmlPath = path.join(tfmDir, xmlFile);
 
       try {
         const content = await fs.promises.readFile(xmlPath, 'utf-8');
@@ -165,6 +162,37 @@ async function buildServiceMap(roots: string[]): Promise<Map<string, ExtractedTf
   }
 
   return serviceMap;
+}
+
+/**
+ * Recursively scan for *.xml files in a directory
+ */
+async function scanXmlFiles(dir: string): Promise<string[]> {
+  const xmlFiles: string[] = [];
+
+  async function scan(currentDir: string) {
+    try {
+      const entries = await fs.promises.readdir(currentDir, { withFileTypes: true });
+
+      for (const entry of entries) {
+        const fullPath = path.join(currentDir, entry.name);
+
+        if (entry.isDirectory()) {
+          // Recursively scan subdirectories
+          await scan(fullPath);
+        } else if (entry.isFile() && entry.name.endsWith('.xml')) {
+          xmlFiles.push(fullPath);
+        }
+      }
+    } catch (err) {
+      if (isDev) {
+        console.warn(`[TFM] Failed to scan directory ${currentDir}:`, err);
+      }
+    }
+  }
+
+  await scan(dir);
+  return xmlFiles;
 }
 
 /**
