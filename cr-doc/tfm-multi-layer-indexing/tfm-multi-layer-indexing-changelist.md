@@ -8,6 +8,7 @@
 - 查找对应的 XML 配置文件
 - 提取实际调用的类和方法
 - 支持多目录层级（定制层/公共层/产品层）
+- **新增**: 显式命令行参数指定各层目录
 
 ## 实现计划
 
@@ -1490,6 +1491,151 @@ npm run build  # ✅ 无错误
 
 ---
 
+### 2026-03-24 - Phase 8: 显式命令行参数支持 (用户体验改进)
+
+#### 背景
+原有实现依赖环境变量 `GITNEXUS_EXTRA_ROOTS` 和当前工作目录来确定层级优先级，用户反馈不够明确。改进为显式命令行参数。
+
+#### 改进目标
+1. 显式指定定制层、公共层、产品层目录
+2. 保持向后兼容（环境变量仍可用）
+3. 提供清晰的帮助信息
+
+#### 实现内容
+
+**1. 命令行参数定义** (`src/cli/index.ts`)
+- 新增 `--customization <path>` 参数
+  - 指定定制层目录（最高优先级）
+  - 默认: 当前目录或 [path] 参数
+- 新增 `--common <path>` 参数
+  - 指定公共层目录（中等优先级）
+  - 可选参数
+- 新增 `--product <path>` 参数
+  - 指定产品层目录（最低优先级）
+  - 可选参数
+- 更新帮助文本:
+  - 标记 `GITNEXUS_EXTRA_ROOTS` 为 legacy/deprecated
+  - 添加使用示例
+
+**2. 参数处理逻辑** (`src/cli/analyze.ts`)
+- 更新 `AnalyzeOptions` 接口添加三个新字段
+- 重构 roots 数组构建逻辑:
+  ```typescript
+  // 优先级: 命令行参数 > 环境变量
+  1. customization: --customization > [path] > 当前目录/git root
+  2. common: --common > GITNEXUS_EXTRA_ROOTS[0]
+  3. product: --product > GITNEXUS_EXTRA_ROOTS[1]
+  ```
+- 智能去重: 自动跳过重复路径
+- 改进输出信息:
+  - "Multi-layer indexing:" 替代 "Indexing N directories:"
+  - 显示层名称: "Customization / Common / Product"
+
+#### 使用示例
+
+**新方式（推荐）:**
+```bash
+# 仅定制层（默认行为，向后兼容）
+gitnexus analyze
+
+# 定制层 + 公共层
+gitnexus analyze --common /path/to/common
+
+# 定制层 + 公共层 + 产品层
+gitnexus analyze --common /path/to/common --product /path/to/product
+
+# 显式指定所有层
+gitnexus analyze --customization /custom --common /common --product /product
+```
+
+**旧方式（仍支持）:**
+```bash
+# Windows
+set GITNEXUS_EXTRA_ROOTS=E:\common;E:\product
+gitnexus analyze
+
+# Unix/Linux
+export GITNEXUS_EXTRA_ROOTS=/common:/product
+gitnexus analyze
+```
+
+#### 输出对比
+
+**旧输出:**
+```
+Indexing 3 directories:
+  Primary: E:\customization
+  Layer 1: E:\common
+  Layer 2: E:\product
+```
+
+**新输出:**
+```
+Multi-layer indexing:
+  Customization: E:\customization
+  Common: E:\common
+  Product: E:\product
+```
+
+#### 向后兼容性
+
+✅ **完全向后兼容**:
+- 不传任何参数: 索引当前目录（原有行为）
+- 只传 [path]: 索引指定目录（原有行为）
+- 使用 `GITNEXUS_EXTRA_ROOTS`: 仍然工作（legacy模式）
+- 命令行参数优先于环境变量
+
+#### 技术细节
+
+**优先级算法:**
+```typescript
+// 1. 定制层
+customization = options.customization || inputPath || cwd/gitRoot
+
+// 2. 公共层
+if (options.common) {
+  roots.push(options.common)
+} else if (GITNEXUS_EXTRA_ROOTS && no CLI options) {
+  roots.push(GITNEXUS_EXTRA_ROOTS[0])
+}
+
+// 3. 产品层
+if (options.product) {
+  roots.push(options.product)
+} else if (GITNEXUS_EXTRA_ROOTS && no CLI options) {
+  roots.push(GITNEXUS_EXTRA_ROOTS[1])
+}
+```
+
+**去重逻辑:**
+- 跳过与定制层相同的路径
+- 使用 `roots.includes()` 避免重复添加
+
+#### 文件变更
+
+**1. `src/cli/index.ts`** (第 24-47 行)
+- 添加 3 个 `.option()` 调用
+- 更新 `.addHelpText()` 内容
+
+**2. `src/cli/analyze.ts`** (第 45-52, 83-150 行)
+- 更新 `AnalyzeOptions` 接口
+- 重构 roots 数组构建逻辑
+- 改进显示信息
+
+#### 编译验证
+```bash
+npm run build  # ✅ 无错误
+node dist/cli/index.js analyze --help  # ✅ 显示新参数
+```
+
+#### 测试状态
+- **编译**: ✅ 通过
+- **帮助信息**: ✅ 正确显示
+- **功能测试**: ⏳ 待手动验证
+- **向后兼容**: ⏳ 待验证
+
+---
+
 ## 最终版本
 
 - **初始实现日期**: 2026-03-17 上午
@@ -1498,5 +1644,6 @@ npm run build  # ✅ 无错误
 - **Bug修复2**: 2026-03-17 晚上（Method content 缺失）
 - **功能增强**: 2026-03-17 晚上（serviceName 属性）
 - **Phase 3 完整实现**: 2026-03-24 下午（TFM 提取逻辑 + Pipeline 类型修复）
+- **Phase 8 用户体验改进**: 2026-03-24 下午（显式命令行参数 --customization/--common/--product）
 - **GitNexus 版本**: 1.4.8+
-- **状态**: ✅ 完成并可用（含多层全量索引 + 层级优先级 + content 修复 + serviceName + AST 提取）
+- **状态**: ✅ 完成并可用（含多层全量索引 + 层级优先级 + 显式参数 + AST 提取）

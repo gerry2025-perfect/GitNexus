@@ -29,9 +29,26 @@ program
   .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
   .option('--skills', 'Generate repo-specific skill files from detected communities')
   .option('--skip-git', 'Index a folder without requiring a .git directory')
-   .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
-   .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
-   .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
+  .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
+  .option('--customization <path>', 'Customization layer directory (default: current directory)')
+  .option('--common <path>', 'Common layer directory (optional)')
+  .option('--product <path>', 'Product layer directory (optional)')
+  .addHelpText('after', `
+Environment variables:
+  GITNEXUS_NO_GITIGNORE=1       Skip .gitignore parsing (still reads .gitnexusignore)
+  GITNEXUS_EXTRA_ROOTS          Legacy: additional directories to index (deprecated, use --common/--product)
+
+Multi-layer indexing:
+  # Using command-line options (recommended)
+  gitnexus analyze --common /path/to/common --product /path/to/product
+
+  # Explicit customization layer
+  gitnexus analyze --customization /custom --common /common --product /product
+
+  # Legacy environment variable (still supported)
+  GITNEXUS_EXTRA_ROOTS=/common:/product gitnexus analyze
+`)
+  .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
   .command('serve')

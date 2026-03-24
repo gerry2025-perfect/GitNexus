@@ -50,6 +50,12 @@ export interface AnalyzeOptions {
   verbose?: boolean;
   /** Index the folder even when no .git directory is present. */
   skipGit?: boolean;
+  /** Customization layer directory (highest priority) */
+  customization?: string;
+  /** Common layer directory (medium priority) */
+  common?: string;
+  /** Product layer directory (lowest priority) */
+  product?: string;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -83,14 +89,19 @@ export const analyzeCommand = async (
 
   console.log('\n  GitNexus Analyzer\n');
 
-  // Read extra roots from environment variable for multi-directory indexing
-  const extraRootsEnv = process.env.GITNEXUS_EXTRA_ROOTS;
+  // Build roots array with layer priority: customization > common > product
   const roots: string[] = [];
 
-  let repoPath: string;
-  if (inputPath) {
-    repoPath = path.resolve(inputPath);
+  // 1. Determine customization layer (highest priority)
+  let customizationPath: string;
+  if (options?.customization) {
+    // Explicit --customization parameter
+    customizationPath = path.resolve(options.customization);
+  } else if (inputPath) {
+    // [path] positional argument
+    customizationPath = path.resolve(inputPath);
   } else {
+    // Default: current directory or git root
     const gitRoot = getGitRoot(process.cwd());
     if (!gitRoot) {
       if (!options?.skipGit) {
@@ -99,33 +110,56 @@ export const analyzeCommand = async (
         return;
       }
       // --skip-git: fall back to cwd as the root
-      repoPath = path.resolve(process.cwd());
+      customizationPath = path.resolve(process.cwd());
     } else {
-      repoPath = gitRoot;
+      customizationPath = gitRoot;
     }
   }
 
-  // Parse extra roots from environment variable
-  roots.push(repoPath); // Primary root is always first
+  roots.push(customizationPath);
 
-  if (extraRootsEnv) {
+  // 2. Add common layer (if specified)
+  if (options?.common) {
+    const commonPath = path.resolve(options.common);
+    if (commonPath !== customizationPath) {
+      roots.push(commonPath);
+    }
+  }
+
+  // 3. Add product layer (if specified)
+  if (options?.product) {
+    const productPath = path.resolve(options.product);
+    if (productPath !== customizationPath && !roots.includes(productPath)) {
+      roots.push(productPath);
+    }
+  }
+
+  // 4. Legacy: read GITNEXUS_EXTRA_ROOTS environment variable
+  // Only used if no command-line layer options are specified
+  const extraRootsEnv = process.env.GITNEXUS_EXTRA_ROOTS;
+  if (extraRootsEnv && !options?.common && !options?.product) {
     const delimiter = process.platform === 'win32' ? ';' : ':';
     const extraRoots = extraRootsEnv.split(delimiter)
       .map(p => path.resolve(p.trim()))
-      .filter(p => p.length > 0 && p !== repoPath); // Avoid duplicates
+      .filter(p => p.length > 0 && !roots.includes(p)); // Avoid duplicates
 
     roots.push(...extraRoots);
-
-    // Display multi-directory info
-    if (roots.length > 1) {
-      console.log(`  Indexing ${roots.length} directories:`);
-      console.log(`    Primary: ${roots[0]}`);
-      for (let i = 1; i < roots.length; i++) {
-        console.log(`    Layer ${i}: ${roots[i]}`);
-      }
-      console.log();
-    }
   }
+
+  // Display layer information
+  if (roots.length > 1) {
+    console.log(`  Multi-layer indexing:`);
+    console.log(`    Customization: ${roots[0]}`);
+    for (let i = 1; i < roots.length; i++) {
+      const layerName = i === 1 && options?.common ? 'Common' :
+                       i === 2 && options?.product ? 'Product' :
+                       `Layer ${i}`;
+      console.log(`    ${layerName}: ${roots[i]}`);
+    }
+    console.log();
+  }
+
+  const repoPath = roots[0]; // Primary root for backward compatibility
 
   const repoHasGit = hasGitDir(repoPath);
   if (!repoHasGit && !options?.skipGit) {
