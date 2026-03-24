@@ -33,6 +33,7 @@ program
   .option('--customization <path>', 'Customization layer directory (default: current directory)')
   .option('--common <path>', 'Common layer directory (optional)')
   .option('--product <path>', 'Product layer directory (optional)')
+  .option('--tfm-report', 'Generate detailed TFM resolution report (development mode only)')
   .addHelpText('after', `
 Environment variables:
   GITNEXUS_NO_GITIGNORE=1       Skip .gitignore parsing (still reads .gitnexusignore)

@@ -56,6 +56,8 @@ export interface AnalyzeOptions {
   common?: string;
   /** Product layer directory (lowest priority) */
   product?: string;
+  /** Generate detailed TFM resolution report */
+  tfmReport?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -281,6 +283,8 @@ export const analyzeCommand = async (
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
     updateBar(scaled, phaseLabel);
+  }, {
+    tfmReport: options?.tfmReport,
   });
 
   // ── Phase 2: LadybugDB (60–85%) ──────────────────────────────────────

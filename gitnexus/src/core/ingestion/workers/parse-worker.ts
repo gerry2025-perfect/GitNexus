@@ -920,6 +920,72 @@ function extractLaravelRoutes(tree: any, filePath: string): ExtractedRoute[] {
 function extractTfmCalls(tree: any, filePath: string): ExtractedTfmCall[] {
   const tfmCalls: ExtractedTfmCall[] = [];
 
+  // Cache: scopeNode -> Map<varName, serviceName>
+  // This avoids re-scanning the same scope multiple times
+  const scopeCache = new Map<any, Map<string, string>>();
+
+  // Build cache for a scope: scan once and collect all serviceName assignments
+  function buildScopeCache(scopeNode: any): Map<string, string> {
+    const serviceNames = new Map<string, string>();
+
+    function scan(node: any): void {
+      // Pattern 1: Method call - varName.setServiceName("ServiceName")
+      if (node.type === 'method_invocation') {
+        const object = node.childForFieldName('object');
+        const name = node.childForFieldName('name');
+        const args = node.childForFieldName('arguments');
+
+        if (object && name?.text === 'setServiceName' && args) {
+          const varName = object.text;
+          const argList = args.namedChildren || [];
+          for (const arg of argList) {
+            if (arg.type === 'string_literal') {
+              const serviceName = arg.text.replace(/^["']|["']$/g, '');
+              serviceNames.set(varName, serviceName);
+              return; // Found, no need to continue
+            }
+          }
+        }
+      }
+
+      // Pattern 2: Field assignment - varName.serviceName = "ServiceName"
+      if (node.type === 'assignment_expression') {
+        const left = node.childForFieldName('left');
+        const right = node.childForFieldName('right');
+
+        if (left?.type === 'field_access') {
+          const object = left.childForFieldName('object');
+          const field = left.childForFieldName('field');
+
+          if (object && field?.text === 'serviceName' && right?.type === 'string_literal') {
+            const varName = object.text;
+            const serviceName = right.text.replace(/^["']|["']$/g, '');
+            serviceNames.set(varName, serviceName);
+            return; // Found, no need to continue
+          }
+        }
+      }
+
+      // Recurse into children
+      for (const child of node.children || []) {
+        scan(child);
+      }
+    }
+
+    scan(scopeNode);
+    return serviceNames;
+  }
+
+  // Get serviceName for a variable in a scope (with caching)
+  function getServiceName(scopeNode: any, varName: string): string | null {
+    let cache = scopeCache.get(scopeNode);
+    if (!cache) {
+      cache = buildScopeCache(scopeNode);
+      scopeCache.set(scopeNode, cache);
+    }
+    return cache.get(varName) || null;
+  }
+
   // Find all ServiceFlow.callService() invocations
   function walk(node: any, parentFunction: any = null): void {
     // Track the enclosing method/function for sourceId
@@ -944,11 +1010,12 @@ function extractTfmCalls(tree: any, filePath: string): ExtractedTfmCall[] {
             endLine: node.endPosition.row,
           };
 
-          // Now search for param.setServiceName("ServiceName") in the same function scope
-          const serviceName = findServiceNameInScope(currentFunction || tree.rootNode, paramVarName);
+          // Look up serviceName from cache
+          const serviceName = getServiceName(currentFunction || tree.rootNode, paramVarName);
 
+          // Java methods use 'Method' label, not 'Function'
           const sourceId = currentFunction
-            ? generateId('Function', `${filePath}:${currentFunction.childForFieldName('name')?.text || 'anonymous'}`)
+            ? generateId('Method', `${filePath}:${currentFunction.childForFieldName('name')?.text || 'anonymous'}`)
             : generateId('File', filePath);
 
           tfmCalls.push({
@@ -966,42 +1033,6 @@ function extractTfmCalls(tree: any, filePath: string): ExtractedTfmCall[] {
     for (const child of node.children || []) {
       walk(child, currentFunction);
     }
-  }
-
-  /**
-   * Search for param.setServiceName("ServiceName") within the given scope.
-   * Returns the service name string, or null if not found.
-   */
-  function findServiceNameInScope(scopeNode: any, varName: string): string | null {
-    function search(node: any): string | null {
-      // Look for method_invocation: varName.setServiceName(...)
-      if (node.type === 'method_invocation') {
-        const object = node.childForFieldName('object');
-        const name = node.childForFieldName('name');
-        const args = node.childForFieldName('arguments');
-
-        if (object?.text === varName && name?.text === 'setServiceName' && args) {
-          // Extract the first string literal argument
-          const argList = args.namedChildren || [];
-          for (const arg of argList) {
-            if (arg.type === 'string_literal') {
-              // Remove quotes from "ServiceName"
-              return arg.text.replace(/^["']|["']$/g, '');
-            }
-          }
-        }
-      }
-
-      // Recurse into children
-      for (const child of node.children || []) {
-        const result = search(child);
-        if (result) return result;
-      }
-
-      return null;
-    }
-
-    return search(scopeNode);
   }
 
   walk(tree.rootNode);

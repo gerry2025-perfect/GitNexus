@@ -416,7 +416,7 @@ export const streamAllCSVsToDisk = async (
 
   // --- Stream relationship CSV ---
   const relCsvPath = path.join(csvDir, 'relations.csv');
-  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step');
+  const relWriter = new BufferedCSVWriter(relCsvPath, 'from,to,type,confidence,reason,step,serviceName');
   for (const rel of graph.iterRelationships()) {
     await relWriter.addRow([
       escapeCSVField(rel.sourceId),
@@ -425,6 +425,7 @@ export const streamAllCSVsToDisk = async (
       escapeCSVNumber(rel.confidence, 1.0),
       escapeCSVField(rel.reason),
       escapeCSVNumber((rel as any).step, 0),
+      escapeCSVField((rel as any).serviceName || ''),
     ].join(','));
   }
   await relWriter.finish();

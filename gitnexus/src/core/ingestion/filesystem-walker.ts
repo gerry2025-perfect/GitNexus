@@ -108,18 +108,39 @@ export const walkRepositoryPaths = async (
 /**
  * Phase 2: Read file contents for a specific set of relative paths.
  * Returns a Map for O(1) lookup. Silently skips files that fail to read.
+ *
+ * Multi-root support: If scannedFiles is provided, uses the root field to locate each file.
  */
 export const readFileContents = async (
-  repoPath: string,
+  repoPath: string | string[],
   relativePaths: string[],
+  scannedFiles?: ScannedFile[]
 ): Promise<Map<string, string>> => {
   const contents = new Map<string, string>();
+  const roots = Array.isArray(repoPath) ? repoPath : [repoPath];
+
+  // Build path→root mapping from scannedFiles if provided
+  const pathToRoot = new Map<string, string>();
+  if (scannedFiles) {
+    for (const file of scannedFiles) {
+      pathToRoot.set(file.path, file.root);
+    }
+  }
 
   for (let start = 0; start < relativePaths.length; start += READ_CONCURRENCY) {
     const batch = relativePaths.slice(start, start + READ_CONCURRENCY);
     const results = await Promise.allSettled(
       batch.map(async relativePath => {
-        const fullPath = path.join(repoPath, relativePath);
+        // Determine which root this file belongs to
+        let fullPath: string;
+        if (pathToRoot.has(relativePath)) {
+          // Use the mapped root from scannedFiles
+          fullPath = path.join(pathToRoot.get(relativePath)!, relativePath);
+        } else {
+          // Fallback: single root or try first root
+          fullPath = path.join(roots[0], relativePath);
+        }
+
         const content = await fs.readFile(fullPath, 'utf-8');
         return { path: relativePath, content };
       })

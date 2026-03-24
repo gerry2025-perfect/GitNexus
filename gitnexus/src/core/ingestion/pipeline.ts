@@ -399,6 +399,8 @@ async function runCrossFileBindingPropagation(
 export interface PipelineOptions {
   /** Skip MRO, community detection, and process extraction for faster test runs. */
   skipGraphPhases?: boolean;
+  /** Generate detailed TFM resolution report file. */
+  tfmReport?: boolean;
 }
 
 export const runPipelineFromRepo = async (
@@ -470,7 +472,7 @@ export const runPipelineFromRepo = async (
     // ── Phase 2.5: Markdown processing (headings + cross-links) ────────
     const mdScanned = scannedFiles.filter(f => f.path.endsWith('.md') || f.path.endsWith('.mdx'));
     if (mdScanned.length > 0) {
-      const mdContents = await readFileContents(primaryRoot, mdScanned.map(f => f.path));
+      const mdContents = await readFileContents(roots, mdScanned.map(f => f.path), mdScanned);
       const mdFiles = mdScanned
         .filter(f => mdContents.has(f.path))
         .map(f => ({ path: f.path, content: mdContents.get(f.path)! }));
@@ -611,7 +613,8 @@ export const runPipelineFromRepo = async (
         const chunkPaths = chunks[chunkIdx];
 
         // Read content for this chunk only
-        const chunkContents = await readFileContents(primaryRoot, chunkPaths);
+        const chunkScanned = scannedFiles.filter(f => chunkPaths.includes(f.path));
+        const chunkContents = await readFileContents(roots, chunkPaths, chunkScanned);
         const chunkFiles = chunkPaths
           .filter(p => chunkContents.has(p))
           .map(p => ({ path: p, content: chunkContents.get(p)! }));
@@ -1036,7 +1039,8 @@ export const runPipelineFromRepo = async (
           symbolTable,
           allTfmCalls,
           allTfmServiceDefs,
-          roots
+          roots,
+          options?.tfmReport
         );
 
         if (isDev) {

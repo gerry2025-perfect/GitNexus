@@ -29,7 +29,8 @@ export async function processTfmCalls(
   symbolTable: SymbolTable,
   tfmCalls: ExtractedTfmCall[],
   tfmServiceDefs: ExtractedTfmServiceDef[],
-  roots: string[]
+  roots: string[],
+  tfmReport?: boolean
 ): Promise<TfmProcessingResult> {
   if (tfmCalls.length === 0) {
     return { resolvedCalls: 0, unresolvedCalls: 0, xmlFilesFound: 0 };
@@ -50,18 +51,25 @@ export async function processTfmCalls(
   let resolvedCount = 0;
   let unresolvedCount = 0;
 
+  // Categorize failures for detailed reporting
+  const failuresByReason = {
+    noServiceName: [] as ExtractedTfmCall[],
+    noXmlMatch: [] as { call: ExtractedTfmCall; serviceName: string }[],
+    classNotFound: [] as { call: ExtractedTfmCall; serviceName: string; targetClass: string }[],
+    methodNotFound: [] as { call: ExtractedTfmCall; serviceName: string; targetClass: string; targetMethod: string }[],
+  };
+
   for (const call of tfmCalls) {
     if (!call.serviceName) {
       unresolvedCount++;
+      failuresByReason.noServiceName.push(call);
       continue;
     }
 
     const serviceDef = serviceMap.get(call.serviceName);
     if (!serviceDef) {
       unresolvedCount++;
-      if (isDev) {
-        console.log(`[TFM] No XML found for service: ${call.serviceName}`);
-      }
+      failuresByReason.noXmlMatch.push({ call, serviceName: call.serviceName });
       continue;
     }
 
@@ -69,9 +77,11 @@ export async function processTfmCalls(
     const targetClasses = symbolTable.findSymbolsByQualifiedName(serviceDef.targetClass);
     if (targetClasses.length === 0) {
       unresolvedCount++;
-      if (isDev) {
-        console.log(`[TFM] Class not found: ${serviceDef.targetClass}`);
-      }
+      failuresByReason.classNotFound.push({
+        call,
+        serviceName: call.serviceName,
+        targetClass: serviceDef.targetClass
+      });
       continue;
     }
 
@@ -87,9 +97,12 @@ export async function processTfmCalls(
 
     if (!targetMethod) {
       unresolvedCount++;
-      if (isDev) {
-        console.log(`[TFM] Method not found: ${serviceDef.targetClass}.${serviceDef.targetMethod}`);
-      }
+      failuresByReason.methodNotFound.push({
+        call,
+        serviceName: call.serviceName,
+        targetClass: serviceDef.targetClass,
+        targetMethod: serviceDef.targetMethod
+      });
       continue;
     }
 
@@ -106,9 +119,73 @@ export async function processTfmCalls(
     });
 
     resolvedCount++;
+  }
 
-    if (isDev) {
-      console.log(`[TFM] Resolved: ${call.serviceName} → ${serviceDef.targetClass}.${serviceDef.targetMethod}`);
+  // Report detailed failure statistics
+  if (isDev || tfmReport) {
+    const reportLines: string[] = [];
+
+    reportLines.push(`\n[TFM] ========== Resolution Summary ==========`);
+    reportLines.push(`[TFM] Total calls: ${tfmCalls.length}`);
+    reportLines.push(`[TFM] Resolved: ${resolvedCount} (${((resolvedCount / tfmCalls.length) * 100).toFixed(1)}%)`);
+    reportLines.push(`[TFM] Unresolved: ${unresolvedCount} (${((unresolvedCount / tfmCalls.length) * 100).toFixed(1)}%)`);
+    reportLines.push(`\n[TFM] Failure breakdown:`);
+    reportLines.push(`[TFM]   1. No serviceName extracted: ${failuresByReason.noServiceName.length}`);
+    reportLines.push(`[TFM]   2. No XML file found: ${failuresByReason.noXmlMatch.length}`);
+    reportLines.push(`[TFM]   3. Target class not found: ${failuresByReason.classNotFound.length}`);
+    reportLines.push(`[TFM]   4. Target method not found: ${failuresByReason.methodNotFound.length}`);
+
+    // Detailed failure logs
+    if (failuresByReason.noServiceName.length > 0) {
+      reportLines.push(`\n[TFM] ========== 1. Failed to extract serviceName (${failuresByReason.noServiceName.length}) ==========`);
+      failuresByReason.noServiceName.forEach((call, idx) => {
+        reportLines.push(`[TFM]   ${idx + 1}. ${call.filePath}:${call.callSite.startLine + 1}`);
+        reportLines.push(`[TFM]      Variable: ${call.paramVarName}`);
+        reportLines.push(`[TFM]      SourceId: ${call.sourceId}`);
+      });
+    }
+
+    if (failuresByReason.noXmlMatch.length > 0) {
+      reportLines.push(`\n[TFM] ========== 2. No XML file found (${failuresByReason.noXmlMatch.length}) ==========`);
+      failuresByReason.noXmlMatch.forEach(({ call, serviceName }, idx) => {
+        reportLines.push(`[TFM]   ${idx + 1}. Service: "${serviceName}"`);
+        reportLines.push(`[TFM]      Called from: ${call.filePath}:${call.callSite.startLine + 1}`);
+        reportLines.push(`[TFM]      Hint: Check if XML file exists: tfm_service/**/${serviceName}.xml`);
+      });
+    }
+
+    if (failuresByReason.classNotFound.length > 0) {
+      reportLines.push(`\n[TFM] ========== 3. Target class not found (${failuresByReason.classNotFound.length}) ==========`);
+      failuresByReason.classNotFound.forEach(({ call, serviceName, targetClass }, idx) => {
+        reportLines.push(`[TFM]   ${idx + 1}. Service: "${serviceName}"`);
+        reportLines.push(`[TFM]      Target class: ${targetClass}`);
+        reportLines.push(`[TFM]      Called from: ${call.filePath}:${call.callSite.startLine + 1}`);
+        reportLines.push(`[TFM]      Hint: Class may not be indexed or package name mismatch`);
+      });
+    }
+
+    if (failuresByReason.methodNotFound.length > 0) {
+      reportLines.push(`\n[TFM] ========== 4. Target method not found (${failuresByReason.methodNotFound.length}) ==========`);
+      failuresByReason.methodNotFound.forEach(({ call, serviceName, targetClass, targetMethod }, idx) => {
+        reportLines.push(`[TFM]   ${idx + 1}. Service: "${serviceName}"`);
+        reportLines.push(`[TFM]      Target: ${targetClass}.${targetMethod}()`);
+        reportLines.push(`[TFM]      Called from: ${call.filePath}:${call.callSite.startLine + 1}`);
+        reportLines.push(`[TFM]      Hint: Method may have different name or not exist in class`);
+      });
+    }
+
+    reportLines.push(`\n[TFM] ==========================================\n`);
+
+    // Output to file if tfmReport is enabled
+    if (tfmReport) {
+      const reportPath = path.join(roots[0], 'tfm-resolution-report.log');
+      fs.writeFileSync(reportPath, reportLines.join('\n'), 'utf-8');
+      if (isDev) {
+        console.log(`[TFM] Detailed report written to: ${reportPath}`);
+      }
+    } else {
+      // Output to console in dev mode
+      reportLines.forEach(line => console.log(line));
     }
   }
 
