@@ -16,6 +16,7 @@ import { extractMiddlewareChain } from './route-extractors/middleware.js';
 import { generateId } from '../../lib/utils.js';
 import type { ExtractedFetchCall, ExtractedRoute, ExtractedDecoratorRoute, ExtractedToolDef } from './workers/parse-worker.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
+import { processTfmCalls } from './tfm-call-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
@@ -352,7 +353,7 @@ async function runCrossFileBindingPropagation(
     if (levelCandidates.length === 0) continue;
 
     const levelPaths = levelCandidates.map(c => c.filePath);
-    const contentMap = await readFileContents(repoPath, levelPaths);
+    const contentMap = await readFileContents(primaryRoot, levelPaths);
 
     for (const { filePath, seeded, importedReturns, importedRawReturns } of levelCandidates) {
       const content = contentMap.get(filePath);
@@ -401,10 +402,13 @@ export interface PipelineOptions {
 }
 
 export const runPipelineFromRepo = async (
-  repoPath: string,
+  repoPath: string | string[],
   onProgress: (progress: PipelineProgress) => void,
   options?: PipelineOptions,
 ): Promise<PipelineResult> => {
+  const roots = Array.isArray(repoPath) ? repoPath : [repoPath];
+  const primaryRoot = roots[0]; // For backward compatibility with single root logic
+
   const graph = createKnowledgeGraph();
   const ctx = createResolutionContext();
   const symbolTable = ctx.symbols;
@@ -424,7 +428,7 @@ export const runPipelineFromRepo = async (
       message: 'Scanning repository...',
     });
 
-    const scannedFiles = await walkRepositoryPaths(repoPath, (current, total, filePath) => {
+    const scannedFiles = await walkRepositoryPaths(roots.length > 1 ? roots : primaryRoot, (current, total, filePath) => {
       const scanProgress = Math.round((current / total) * 15);
       onProgress({
         phase: 'extracting',
@@ -466,7 +470,7 @@ export const runPipelineFromRepo = async (
     // ── Phase 2.5: Markdown processing (headings + cross-links) ────────
     const mdScanned = scannedFiles.filter(f => f.path.endsWith('.md') || f.path.endsWith('.mdx'));
     if (mdScanned.length > 0) {
-      const mdContents = await readFileContents(repoPath, mdScanned.map(f => f.path));
+      const mdContents = await readFileContents(primaryRoot, mdScanned.map(f => f.path));
       const mdFiles = mdScanned
         .filter(f => mdContents.has(f.path))
         .map(f => ({ path: f.path, content: mdContents.get(f.path)! }));
@@ -598,13 +602,16 @@ export const runPipelineFromRepo = async (
     const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
     // Accumulate MCP/RPC tool definitions (@mcp.tool(), @app.tool(), etc.)
     const allToolDefs: ExtractedToolDef[] = [];
+    // Accumulate TFM service calls from Java code
+    const allTfmCalls: import('./workers/parse-worker.js').ExtractedTfmCall[] = [];
+    const allTfmServiceDefs: import('./workers/parse-worker.js').ExtractedTfmServiceDef[] = [];
 
     try {
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
         const chunkPaths = chunks[chunkIdx];
 
         // Read content for this chunk only
-        const chunkContents = await readFileContents(repoPath, chunkPaths);
+        const chunkContents = await readFileContents(primaryRoot, chunkPaths);
         const chunkFiles = chunkPaths
           .filter(p => chunkContents.has(p))
           .map(p => ({ path: p, content: chunkContents.get(p)! }));
@@ -726,6 +733,12 @@ export const runPipelineFromRepo = async (
           if (chunkWorkerData.toolDefs?.length) {
             allToolDefs.push(...chunkWorkerData.toolDefs);
           }
+          if (chunkWorkerData.tfmCalls?.length) {
+            allTfmCalls.push(...chunkWorkerData.tfmCalls);
+          }
+          if (chunkWorkerData.tfmServiceDefs?.length) {
+            allTfmServiceDefs.push(...chunkWorkerData.tfmServiceDefs);
+          }
         } else {
           await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
           sequentialChunkPaths.push(chunkPaths);
@@ -797,7 +810,7 @@ export const runPipelineFromRepo = async (
 
     if (routeRegistry.size > 0) {
       const handlerPaths = [...routeRegistry.values()].map(e => e.filePath);
-      const handlerContents = await readFileContents(repoPath, handlerPaths);
+      const handlerContents = await readFileContents(primaryRoot, handlerPaths);
 
       for (const [routeURL, entry] of routeRegistry) {
         const { filePath: handlerPath, source: routeSource } = entry;
@@ -1009,6 +1022,28 @@ export const runPipelineFromRepo = async (
         console.log(`🔀 MRO: ${mroResult.entries.length} classes analyzed, ${mroResult.ambiguityCount} ambiguities found, ${mroResult.overrideEdges} OVERRIDES edges`);
       }
 
+      // ── Phase 4.6: TFM Service Call Resolution ──────────────────────────
+      if (allTfmCalls.length > 0) {
+        onProgress({
+          phase: 'calls',
+          percent: 81,
+          message: 'Resolving TFM service calls...',
+          stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+        });
+
+        const tfmResult = await processTfmCalls(
+          graph,
+          symbolTable,
+          allTfmCalls,
+          allTfmServiceDefs,
+          roots
+        );
+
+        if (isDev) {
+          console.log(`🔧 TFM: Resolved ${tfmResult.resolvedCalls}/${allTfmCalls.length} service calls, found ${tfmResult.xmlFilesFound} XML definitions`);
+        }
+      }
+
       // ── Phase 5: Communities ───────────────────────────────────────────
       onProgress({
         phase: 'communities',
@@ -1192,7 +1227,7 @@ export const runPipelineFromRepo = async (
 
     astCache.clear();
 
-    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult };
+    return { graph, repoPath: primaryRoot, totalFileCount: totalFiles, communityResult, processResult };
   } catch (error) {
     cleanup();
     throw error;

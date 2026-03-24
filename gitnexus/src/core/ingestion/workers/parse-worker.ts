@@ -148,6 +148,34 @@ export interface ExtractedHeritage {
   kind: string;
 }
 
+/** TFM service call extracted from Java AST */
+export interface ExtractedTfmCall {
+  filePath: string;
+  /** Source function/method containing the call */
+  sourceId: string;
+  /** ServiceFlow.callService(...) invocation location */
+  callSite: {
+    startLine: number;
+    endLine: number;
+  };
+  /** Service name from setServiceName() call, e.g. "QryUserInfo" */
+  serviceName: string | null;
+  /** Variable name holding the DynamicDict parameter */
+  paramVarName: string;
+}
+
+/** TFM service definition extracted from XML configuration */
+export interface ExtractedTfmServiceDef {
+  /** Service name (XML filename without .xml) */
+  serviceName: string;
+  /** Full qualified class name from <definition> */
+  targetClass: string;
+  /** Method name from <method_def>, defaults to "perform" */
+  targetMethod: string;
+  /** Which root directory the XML was found in (for multi-layer priority) */
+  sourceRoot: string;
+}
+
 export interface ExtractedRoute {
   filePath: string;
   httpMethod: string;
@@ -208,6 +236,10 @@ export interface ParseWorkerResult {
   constructorBindings: FileConstructorBindings[];
   /** File-scope type bindings from TypeEnv fixpoint for exported symbol collection. */
   typeEnvBindings: FileTypeEnvBindings[];
+  /** TFM service calls extracted from Java code */
+  tfmCalls: ExtractedTfmCall[];
+  /** TFM service definitions (currently unused, populated by processor) */
+  tfmServiceDefs: ExtractedTfmServiceDef[];
   skippedLanguages: Record<string, number>;
   fileCount: number;
 }
@@ -307,6 +339,8 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     toolDefs: [],
     constructorBindings: [],
     typeEnvBindings: [],
+    tfmCalls: [],
+    tfmServiceDefs: [],
     skippedLanguages: {},
     fileCount: 0,
   };

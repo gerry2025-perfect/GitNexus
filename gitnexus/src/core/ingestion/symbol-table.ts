@@ -73,6 +73,19 @@ export interface SymbolTable {
   lookupFieldByOwner: (ownerNodeId: string, fieldName: string) => SymbolDefinition | undefined;
 
   /**
+   * Find symbols by fully qualified name (e.g., "com.example.UserService")
+   * Matches package path structure against file paths.
+   * Used by TFM processor to resolve Java class names from XML configuration.
+   */
+  findSymbolsByQualifiedName: (qualifiedName: string) => SymbolDefinition[];
+
+  /**
+   * Find a specific method within a class by class nodeId and method name.
+   * Used by TFM processor after finding target class to locate the method.
+   */
+  findMethodInClass: (classNodeId: string, methodName: string) => SymbolDefinition | undefined;
+
+  /**
    * Debugging: See how many symbols are tracked
    */
   getStats: () => { fileCount: number; globalSymbolCount: number };
@@ -190,6 +203,51 @@ export const createSymbolTable = (): SymbolTable => {
     return fieldByOwner.get(`${ownerNodeId}\0${fieldName}`);
   };
 
+  const findSymbolsByQualifiedName = (qualifiedName: string): SymbolDefinition[] => {
+    // Parse qualified name: "com.example.service.UserService" → package="com/example/service", class="UserService"
+    const parts = qualifiedName.split('.');
+    if (parts.length === 0) return [];
+
+    const className = parts[parts.length - 1];
+    const packagePath = parts.slice(0, -1).join('/');
+
+    // Get all candidates with matching simple name
+    const candidates = globalIndex.get(className) || [];
+
+    // Filter to match package structure in file path
+    return candidates.filter(def => {
+      // Only match Class and Interface types
+      if (def.type !== 'Class' && def.type !== 'Interface') return false;
+
+      // Check if file path contains the package structure
+      // e.g., filePath should contain "com/example/service/UserService.java"
+      const normalizedPath = def.filePath.replace(/\\/g, '/');
+
+      if (packagePath.length === 0) {
+        // No package - match any file named ClassName.java
+        return normalizedPath.endsWith(`/${className}.java`) || normalizedPath.endsWith(`/${className}.kt`);
+      }
+
+      // Match package + class name
+      const expectedPattern = `/${packagePath}/${className}.`;
+      return normalizedPath.includes(expectedPattern);
+    });
+  };
+
+  const findMethodInClass = (classNodeId: string, methodName: string): SymbolDefinition | undefined => {
+    // Iterate through global index to find methods owned by this class
+    const candidates = globalIndex.get(methodName) || [];
+
+    for (const def of candidates) {
+      // Match methods/constructors that belong to the specified class
+      if ((def.type === 'Method' || def.type === 'Constructor') && def.ownerId === classNodeId) {
+        return def;
+      }
+    }
+
+    return undefined;
+  };
+
   const getStats = () => ({
     fileCount: fileIndex.size,
     globalSymbolCount: globalIndex.size
@@ -202,5 +260,5 @@ export const createSymbolTable = (): SymbolTable => {
     fieldByOwner.clear();
   };
 
-  return { add, lookupExact, lookupExactFull, lookupExactAll, lookupFuzzy, lookupFuzzyCallable, lookupFieldByOwner, getStats, clear };
+  return { add, lookupExact, lookupExactFull, lookupExactAll, lookupFuzzy, lookupFuzzyCallable, lookupFieldByOwner, findSymbolsByQualifiedName, findMethodInClass, getStats, clear };
 };

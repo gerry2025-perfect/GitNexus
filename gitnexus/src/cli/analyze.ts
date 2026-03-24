@@ -83,6 +83,10 @@ export const analyzeCommand = async (
 
   console.log('\n  GitNexus Analyzer\n');
 
+  // Read extra roots from environment variable for multi-directory indexing
+  const extraRootsEnv = process.env.GITNEXUS_EXTRA_ROOTS;
+  const roots: string[] = [];
+
   let repoPath: string;
   if (inputPath) {
     repoPath = path.resolve(inputPath);
@@ -98,6 +102,28 @@ export const analyzeCommand = async (
       repoPath = path.resolve(process.cwd());
     } else {
       repoPath = gitRoot;
+    }
+  }
+
+  // Parse extra roots from environment variable
+  roots.push(repoPath); // Primary root is always first
+
+  if (extraRootsEnv) {
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    const extraRoots = extraRootsEnv.split(delimiter)
+      .map(p => path.resolve(p.trim()))
+      .filter(p => p.length > 0 && p !== repoPath); // Avoid duplicates
+
+    roots.push(...extraRoots);
+
+    // Display multi-directory info
+    if (roots.length > 1) {
+      console.log(`  Indexing ${roots.length} directories:`);
+      console.log(`    Primary: ${roots[0]}`);
+      for (let i = 1; i < roots.length; i++) {
+        console.log(`    Layer ${i}: ${roots[i]}`);
+      }
+      console.log();
     }
   }
 
@@ -217,7 +243,7 @@ export const analyzeCommand = async (
   }
 
   // ── Phase 1: Full Pipeline (0–60%) ─────────────────────────────────
-  const pipelineResult = await runPipelineFromRepo(repoPath, (progress) => {
+  const pipelineResult = await runPipelineFromRepo(roots.length > 1 ? roots : repoPath, (progress) => {
     const phaseLabel = PHASE_LABELS[progress.phase] || progress.phase;
     const scaled = Math.round(progress.percent * 0.6);
     updateBar(scaled, phaseLabel);

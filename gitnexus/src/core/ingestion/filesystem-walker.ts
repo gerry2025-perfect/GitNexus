@@ -12,6 +12,7 @@ export interface FileEntry {
 export interface ScannedFile {
   path: string;
   size: number;
+  root: string;  // Which root directory this file belongs to
 }
 
 /** Path-only reference (for type signatures) */
@@ -27,53 +28,81 @@ const MAX_FILE_SIZE = 512 * 1024;
 /**
  * Phase 1: Scan repository — stat files to get paths + sizes, no content loaded.
  * Memory: ~10MB for 100K files vs ~1GB+ with content.
+ * Supports multi-directory indexing via array input.
  */
 export const walkRepositoryPaths = async (
-  repoPath: string,
+  repoPath: string | string[],
   onProgress?: (current: number, total: number, filePath: string) => void
 ): Promise<ScannedFile[]> => {
-  const ignoreFilter = await createIgnoreFilter(repoPath);
+  const roots = Array.isArray(repoPath) ? repoPath : [repoPath];
+  const allEntries: ScannedFile[] = [];
+  let globalProcessed = 0;
+  let globalTotal = 0;
 
-  const filtered = await glob('**/*', {
-    cwd: repoPath,
-    nodir: true,
-    dot: false,
-    ignore: ignoreFilter,
-  });
-  const entries: ScannedFile[] = [];
-  let processed = 0;
-  let skippedLarge = 0;
+  // First pass: count total files across all roots
+  const rootFileCounts: number[] = [];
+  for (const root of roots) {
+    const ignoreFilter = await createIgnoreFilter(root);
+    const filtered = await glob('**/*', {
+      cwd: root,
+      nodir: true,
+      dot: false,
+      ignore: ignoreFilter,
+    });
+    rootFileCounts.push(filtered.length);
+    globalTotal += filtered.length;
+  }
 
-  for (let start = 0; start < filtered.length; start += READ_CONCURRENCY) {
-    const batch = filtered.slice(start, start + READ_CONCURRENCY);
-    const results = await Promise.allSettled(
-      batch.map(async relativePath => {
-        const fullPath = path.join(repoPath, relativePath);
-        const stat = await fs.stat(fullPath);
-        if (stat.size > MAX_FILE_SIZE) {
-          skippedLarge++;
-          return null;
+  // Second pass: scan each root
+  for (let rootIdx = 0; rootIdx < roots.length; rootIdx++) {
+    const root = roots[rootIdx];
+    const ignoreFilter = await createIgnoreFilter(root);
+
+    const filtered = await glob('**/*', {
+      cwd: root,
+      nodir: true,
+      dot: false,
+      ignore: ignoreFilter,
+    });
+
+    let skippedLarge = 0;
+
+    for (let start = 0; start < filtered.length; start += READ_CONCURRENCY) {
+      const batch = filtered.slice(start, start + READ_CONCURRENCY);
+      const results = await Promise.allSettled(
+        batch.map(async relativePath => {
+          const fullPath = path.join(root, relativePath);
+          const stat = await fs.stat(fullPath);
+          if (stat.size > MAX_FILE_SIZE) {
+            skippedLarge++;
+            return null;
+          }
+          return {
+            path: relativePath.replace(/\\/g, '/'),
+            size: stat.size,
+            root  // Track which root this file belongs to
+          };
+        })
+      );
+
+      for (const result of results) {
+        globalProcessed++;
+        if (result.status === 'fulfilled' && result.value !== null) {
+          allEntries.push(result.value);
+          onProgress?.(globalProcessed, globalTotal, result.value.path);
+        } else {
+          const failedPath = batch[results.indexOf(result)];
+          onProgress?.(globalProcessed, globalTotal, failedPath);
         }
-        return { path: relativePath.replace(/\\/g, '/'), size: stat.size };
-      })
-    );
-
-    for (const result of results) {
-      processed++;
-      if (result.status === 'fulfilled' && result.value !== null) {
-        entries.push(result.value);
-        onProgress?.(processed, filtered.length, result.value.path);
-      } else {
-        onProgress?.(processed, filtered.length, batch[results.indexOf(result)]);
       }
+    }
+
+    if (skippedLarge > 0 && process.env.GITNEXUS_VERBOSE) {
+      console.warn(`  [Root ${rootIdx + 1}/${roots.length}] Skipped ${skippedLarge} files > 512KB`);
     }
   }
 
-  if (skippedLarge > 0) {
-    console.warn(`  Skipped ${skippedLarge} large files (>${MAX_FILE_SIZE / 1024}KB, likely generated/vendored)`);
-  }
-
-  return entries;
+  return allEntries;
 };
 
 /**
