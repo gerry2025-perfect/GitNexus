@@ -93,6 +93,8 @@ Repository indexed successfully (198.9s)
 
 ## 🔍 验证 TFM 关系
 
+### 查询 TFM 调用（带服务名）
+
 ```bash
 npx gitnexus cypher "
   MATCH (caller)-[r:CodeRelation {
@@ -101,9 +103,38 @@ npx gitnexus cypher "
   }]->(target)
   RETURN
     caller.name AS Caller,
-    r.serviceName AS Service,
-    target.name AS Target
+    r.serviceName AS ServiceName,
+    target.name AS Target,
+    r.confidence AS Confidence
   LIMIT 10
+"
+```
+
+### 按服务名过滤
+
+```bash
+npx gitnexus cypher "
+  MATCH (caller)-[r:CodeRelation {
+    type: 'CALLS',
+    serviceName: 'QryUserInfo'
+  }]->(target)
+  RETURN caller.name, target.name
+"
+```
+
+### 统计各服务调用次数
+
+```bash
+npx gitnexus cypher "
+  MATCH ()-[r:CodeRelation {
+    type: 'CALLS',
+    reason: 'tfm-service-resolution'
+  }]->()
+  RETURN
+    r.serviceName AS Service,
+    count(*) AS CallCount
+  ORDER BY CallCount DESC
+  LIMIT 20
 "
 ```
 

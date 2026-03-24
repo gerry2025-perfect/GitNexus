@@ -102,6 +102,7 @@ export async function processTfmCalls(
       type: 'CALLS',
       confidence: 0.95,
       reason: 'tfm-service-resolution',
+      serviceName: call.serviceName || serviceDef.serviceName, // TFM service name
     });
 
     resolvedCount++;

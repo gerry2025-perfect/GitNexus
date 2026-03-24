@@ -118,6 +118,8 @@ export interface GraphRelationship {
   reason: string,
   /** Step number for STEP_IN_PROCESS relationships (1-indexed) */
   step?: number,
+  /** TFM service name for CALLS relationships resolved via TFM (optional) */
+  serviceName?: string,
 }
 
 export interface KnowledgeGraph {
