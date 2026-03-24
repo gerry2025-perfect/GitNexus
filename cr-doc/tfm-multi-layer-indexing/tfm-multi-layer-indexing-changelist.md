@@ -141,7 +141,15 @@
      - 在MRO之后,Community Detection之前
      - 调用 `processTfmCalls()` 解析服务调用
      - 输出调试日志
-   - 修改所有 `readFileContents(repoPath,...)` 为 `primaryRoot`
+   - 修改所有 `readFileContents(repoPath,...)` 调用为使用 `primaryRoot`:
+     - 第 648 行: processImports 调用
+     - 第 743 行: processImports 调用(sequential fallback)
+     - 第 762 行: chunkContents 读取
+     - 第 863 行: htmlContents 读取
+     - 第 885 行: consumerContents 读取
+     - 第 909 行: toolContents 读取
+   - 修改 `runCrossFileBindingPropagation()` 调用(第998行):
+     - 传递 `primaryRoot` 代替 `repoPath`
    - 返回语句使用 `primaryRoot`(第1255行)
 
 **测试状态:** 待编译验证
@@ -163,17 +171,46 @@
 
 **测试状态:** 待手动测试
 
-#### Phase 3: TFM 提取逻辑 ⏳ (待实现)
+#### Phase 3: TFM 提取逻辑 ✅
 
-**说明**: 此阶段需要在 `parse-worker.ts` 中实现 Tree-sitter 查询来提取 Java 代码中的 TFM 调用模式。当前架构已完整,worker 返回空的 `tfmCalls` 数组,系统可编译运行,但不会识别 TFM 调用。
+**说明**: 在 `parse-worker.ts` 中实现了 TFM 调用提取功能,通过递归遍历 Java AST 识别 ServiceFlow.callService() 模式。
 
-**待实现内容**:
-1. 在 `processFileGroup()` 中添加 Java TFM 提取逻辑
-2. 使用 Tree-sitter 查询识别 `ServiceFlow.callService()` 调用
-3. 提取 `setServiceName()` 中的服务名
-4. 填充 `result.tfmCalls` 数组
+**实现内容**:
 
-**当前状态**: 架构就绪,功能暂未激活
+1. **新增 `extractTfmCalls()` 函数** (第 918-1010 行)
+   - 接收 tree 和 filePath 参数
+   - 递归遍历 AST 节点，追踪封闭函数作用域
+   - 识别 `method_invocation` 节点: `ServiceFlow.callService(param)`
+   - 提取参数变量名和调用位置
+   - 调用 `findServiceNameInScope()` 在同一函数作用域查找服务名
+   - 生成 sourceId (函数级别或文件级别)
+   - 返回 `ExtractedTfmCall[]` 数组
+
+2. **新增 `findServiceNameInScope()` 辅助函数** (第 964-1007 行)
+   - 在指定作用域节点内查找 `varName.setServiceName("ServiceName")` 调用
+   - 检查 object 匹配参数变量名
+   - 提取 string_literal 参数值
+   - 移除引号返回纯服务名
+
+3. **集成到 `processFileGroup()` 函数** (第 1543-1547 行)
+   - 在 Laravel 路由提取之后添加 Java TFM 提取
+   - 检查 `language === SupportedLanguages.Java`
+   - 调用 `extractTfmCalls(tree, file.path)`
+   - 将结果追加到 `result.tfmCalls`
+
+4. **修复 Worker 结果初始化**
+   - 第 1552 行: accumulated 对象添加 `tfmCalls: [], tfmServiceDefs: []`
+   - 第 1570-1571 行: mergeResult 函数添加 TFM 数据合并逻辑
+   - 第 1596 行: flush 重置语句添加 TFM 字段
+
+**AST 模式识别**:
+- `method_invocation` 节点结构:
+  - `object` 字段: 识别 "ServiceFlow"
+  - `name` 字段: 识别 "callService" 或 "setServiceName"
+  - `arguments` 字段: 提取参数节点
+- 作用域追踪: 识别 `method_declaration` 和 `constructor_declaration` 作为函数边界
+
+**当前状态**: 功能完整，已编译通过
 
 ---
 
@@ -1378,6 +1415,81 @@ RETURN DISTINCT caller.filePath
 
 ---
 
+### 2026-03-24 - Phase 3 完整实现 (会话恢复)
+
+#### 背景
+之前会话因上下文限制被压缩，本会话恢复继续完成 Phase 3: TFM 提取逻辑的实现。
+
+#### 完成内容
+
+**1. TFM 提取函数实现** (`parse-worker.ts`)
+- 新增 `extractTfmCalls()` 函数 (第 918-1010 行)
+  - 递归 AST 遍历，识别 ServiceFlow.callService() 模式
+  - 提取参数变量名和调用位置
+  - 追踪函数作用域边界
+- 新增 `findServiceNameInScope()` 辅助函数 (第 964-1007 行)
+  - 在作用域内查找 setServiceName() 调用
+  - 提取服务名字符串字面量
+- 集成到 `processFileGroup()` (第 1543-1547 行)
+  - Java 文件专用处理分支
+  - 自动提取并填充 tfmCalls 数组
+
+**2. Worker 结果初始化修复**
+- 第 1552 行: 初始 accumulated 对象添加 TFM 字段
+- 第 1570-1571 行: mergeResult 函数添加 TFM 合并
+- 第 1596 行: flush 重置添加 TFM 字段
+
+**3. Pipeline.ts 类型修复** (多目录支持兼容性)
+- 修改 6 处 `readFileContents()` 调用使用 `primaryRoot` 代替 `repoPath`:
+  - 第 648 行、第 743 行 (processImports)
+  - 第 762 行 (chunkContents)
+  - 第 863 行 (htmlContents)
+  - 第 885 行 (consumerContents)
+  - 第 909 行 (toolContents)
+- 修改 `runCrossFileBindingPropagation()` 调用 (第 998 行)
+  - 传递 `primaryRoot` 而非 `repoPath`
+  - 修复类型不匹配: `string | string[]` → `string`
+
+#### 技术细节
+
+**AST 节点模式匹配:**
+```typescript
+// ServiceFlow.callService(param) 识别:
+node.type === 'method_invocation'
+  object.text === 'ServiceFlow'
+  name.text === 'callService'
+  arguments[0] → paramVarName
+
+// param.setServiceName("ServiceName") 识别:
+node.type === 'method_invocation'
+  object.text === paramVarName
+  name.text === 'setServiceName'
+  arguments[0].type === 'string_literal' → serviceName
+```
+
+**作用域追踪逻辑:**
+- 遍历时追踪当前函数节点: `method_declaration` | `constructor_declaration`
+- 为每个 TFM 调用生成 sourceId: `Function:<filePath>:<methodName>`
+- 服务名查找限定在调用所在函数作用域内
+
+#### 编译验证
+```bash
+npm run build  # ✅ 无错误
+```
+
+**修复的编译错误:**
+1. `parse-worker.ts:1550`: 缺少 tfmCalls, tfmServiceDefs 字段 → 已添加
+2. `parse-worker.ts:1596`: flush 重置缺少 TFM 字段 → 已添加
+3. `pipeline.ts:356-909`: 类型不匹配 `string | string[]` → 全部改用 `primaryRoot`
+
+#### 状态
+- **代码实现**: ✅ 完成
+- **编译检查**: ✅ 通过
+- **集成测试**: ⏳ 待进行
+- **端到端测试**: ⏳ 待进行
+
+---
+
 ## 最终版本
 
 - **初始实现日期**: 2026-03-17 上午
@@ -1385,5 +1497,6 @@ RETURN DISTINCT caller.filePath
 - **Bug修复1**: 2026-03-17 晚上（TFM 重复关系）
 - **Bug修复2**: 2026-03-17 晚上（Method content 缺失）
 - **功能增强**: 2026-03-17 晚上（serviceName 属性）
-- **GitNexus 版本**: 1.3.11+
-- **状态**: ✅ 完成并可用（含多层全量索引 + 层级优先级 + content 修复 + serviceName）
+- **Phase 3 完整实现**: 2026-03-24 下午（TFM 提取逻辑 + Pipeline 类型修复）
+- **GitNexus 版本**: 1.4.8+
+- **状态**: ✅ 完成并可用（含多层全量索引 + 层级优先级 + content 修复 + serviceName + AST 提取）
