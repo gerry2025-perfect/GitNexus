@@ -353,7 +353,7 @@ async function runCrossFileBindingPropagation(
     if (levelCandidates.length === 0) continue;
 
     const levelPaths = levelCandidates.map(c => c.filePath);
-    const contentMap = await readFileContents(primaryRoot, levelPaths);
+    const contentMap = await readFileContents(repoPath, levelPaths);
 
     for (const { filePath, seeded, importedReturns, importedRawReturns } of levelCandidates) {
       const content = contentMap.get(filePath);
@@ -645,7 +645,7 @@ export const runPipelineFromRepo = async (
               detail: `${current}/${total} files`,
               stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
             });
-          }, repoPath, importCtx);
+          }, primaryRoot, importCtx);
           // ── Wildcard-import synthesis (Ruby / C/C++ / Swift / Go) + Python module aliases ─
           // Synthesize namedImportMap entries for wildcard-import languages and build
           // moduleAliasMap for Python namespace imports. Must run after imports are resolved
@@ -740,7 +740,7 @@ export const runPipelineFromRepo = async (
             allTfmServiceDefs.push(...chunkWorkerData.tfmServiceDefs);
           }
         } else {
-          await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
+          await processImports(graph, chunkFiles, astCache, ctx, undefined, primaryRoot, allPaths);
           sequentialChunkPaths.push(chunkPaths);
         }
 
@@ -759,7 +759,7 @@ export const runPipelineFromRepo = async (
     // before any call resolution — same rationale as the worker-path inline synthesis.
     if (sequentialChunkPaths.length > 0) synthesizeWildcardImportBindings(graph, ctx);
     for (const chunkPaths of sequentialChunkPaths) {
-      const chunkContents = await readFileContents(repoPath, chunkPaths);
+      const chunkContents = await readFileContents(primaryRoot, chunkPaths);
       const chunkFiles = chunkPaths
         .filter(p => chunkContents.has(p))
         .map(p => ({ path: p, content: chunkContents.get(p)! }));
@@ -860,7 +860,7 @@ export const runPipelineFromRepo = async (
       p.endsWith('.ejs') || p.endsWith('.hbs') || p.endsWith('.blade.php')
     );
     if (htmlCandidates.length > 0 && routeRegistry.size > 0) {
-      const htmlContents = await readFileContents(repoPath, htmlCandidates);
+      const htmlContents = await readFileContents(primaryRoot, htmlCandidates);
       const htmlPatterns = [/action=["']([^"']+)["']/g, /url:\s*["']([^"']+)["']/g];
       for (const [filePath, content] of htmlContents) {
         for (const pattern of htmlPatterns) {
@@ -882,7 +882,7 @@ export const runPipelineFromRepo = async (
 
       // Read consumer file contents so we can extract property access patterns
       const consumerPaths = [...new Set(allFetchCalls.map(c => c.filePath))];
-      const consumerContents = await readFileContents(repoPath, consumerPaths);
+      const consumerContents = await readFileContents(primaryRoot, consumerPaths);
 
       processNextjsFetchRoutes(graph, allFetchCalls, routeURLToFile, consumerContents);
       if (isDev) {
@@ -906,7 +906,7 @@ export const runPipelineFromRepo = async (
       && !p.includes('node_modules') && !p.includes('test') && !p.includes('__')
     );
     if (toolCandidatePaths.length > 0) {
-      const toolContents = await readFileContents(repoPath, toolCandidatePaths);
+      const toolContents = await readFileContents(primaryRoot, toolCandidatePaths);
       for (const [filePath, content] of toolContents) {
         // Only scan files that contain 'inputSchema' — this is the MCP tool signature
         if (!content.includes('inputSchema')) continue;
@@ -995,7 +995,7 @@ export const runPipelineFromRepo = async (
 
     // ── Phase 14: Cross-file binding propagation ──────────────────────
     await runCrossFileBindingPropagation(
-      graph, ctx, exportedTypeMap, allPaths, totalFiles, repoPath, pipelineStart, onProgress,
+      graph, ctx, exportedTypeMap, allPaths, totalFiles, primaryRoot, pipelineStart, onProgress,
     );
 
     // Free import resolution context — suffix index + resolve cache no longer needed

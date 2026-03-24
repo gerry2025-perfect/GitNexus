@@ -913,6 +913,101 @@ function extractLaravelRoutes(tree: any, filePath: string): ExtractedRoute[] {
   return routes;
 }
 
+/**
+ * Extract TFM (Transaction Flow Management) service calls from Java code.
+ * Pattern: ServiceFlow.callService(param) where param.setServiceName("ServiceName")
+ */
+function extractTfmCalls(tree: any, filePath: string): ExtractedTfmCall[] {
+  const tfmCalls: ExtractedTfmCall[] = [];
+
+  // Find all ServiceFlow.callService() invocations
+  function walk(node: any, parentFunction: any = null): void {
+    // Track the enclosing method/function for sourceId
+    let currentFunction = parentFunction;
+    if (node.type === 'method_declaration' || node.type === 'constructor_declaration') {
+      currentFunction = node;
+    }
+
+    // Detect method_invocation: ServiceFlow.callService(param)
+    if (node.type === 'method_invocation') {
+      const object = node.childForFieldName('object');
+      const name = node.childForFieldName('name');
+      const args = node.childForFieldName('arguments');
+
+      if (object?.text === 'ServiceFlow' && name?.text === 'callService' && args) {
+        // Extract the first argument (should be the parameter variable)
+        const argList = args.namedChildren || [];
+        if (argList.length > 0) {
+          const paramVarName = argList[0].text;
+          const callSite = {
+            startLine: node.startPosition.row,
+            endLine: node.endPosition.row,
+          };
+
+          // Now search for param.setServiceName("ServiceName") in the same function scope
+          const serviceName = findServiceNameInScope(currentFunction || tree.rootNode, paramVarName);
+
+          const sourceId = currentFunction
+            ? generateId('Function', `${filePath}:${currentFunction.childForFieldName('name')?.text || 'anonymous'}`)
+            : generateId('File', filePath);
+
+          tfmCalls.push({
+            filePath,
+            sourceId,
+            callSite,
+            serviceName,
+            paramVarName,
+          });
+        }
+      }
+    }
+
+    // Recurse into children
+    for (const child of node.children || []) {
+      walk(child, currentFunction);
+    }
+  }
+
+  /**
+   * Search for param.setServiceName("ServiceName") within the given scope.
+   * Returns the service name string, or null if not found.
+   */
+  function findServiceNameInScope(scopeNode: any, varName: string): string | null {
+    function search(node: any): string | null {
+      // Look for method_invocation: varName.setServiceName(...)
+      if (node.type === 'method_invocation') {
+        const object = node.childForFieldName('object');
+        const name = node.childForFieldName('name');
+        const args = node.childForFieldName('arguments');
+
+        if (object?.text === varName && name?.text === 'setServiceName' && args) {
+          // Extract the first string literal argument
+          const argList = args.namedChildren || [];
+          for (const arg of argList) {
+            if (arg.type === 'string_literal') {
+              // Remove quotes from "ServiceName"
+              return arg.text.replace(/^["']|["']$/g, '');
+            }
+          }
+        }
+      }
+
+      // Recurse into children
+      for (const child of node.children || []) {
+        const result = search(child);
+        if (result) return result;
+      }
+
+      return null;
+    }
+
+    return search(scopeNode);
+  }
+
+  walk(tree.rootNode);
+  return tfmCalls;
+}
+
 const processFileGroup = (
   files: ParseWorkerInput[],
   language: SupportedLanguages,
@@ -1438,6 +1533,12 @@ const processFileGroup = (
       const extractedRoutes = extractLaravelRoutes(tree, file.path);
       result.routes.push(...extractedRoutes);
     }
+
+    // Extract TFM service calls from Java files
+    if (language === SupportedLanguages.Java) {
+      const extractedTfmCalls = extractTfmCalls(tree, file.path);
+      result.tfmCalls.push(...extractedTfmCalls);
+    }
   }
 };
 
@@ -1448,7 +1549,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], constructorBindings: [], typeEnvBindings: [], tfmCalls: [], tfmServiceDefs: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1466,6 +1567,8 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.toolDefs.push(...src.toolDefs);
   target.constructorBindings.push(...src.constructorBindings);
   target.typeEnvBindings.push(...src.typeEnvBindings);
+  target.tfmCalls.push(...src.tfmCalls);
+  target.tfmServiceDefs.push(...src.tfmServiceDefs);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
@@ -1490,7 +1593,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], constructorBindings: [], typeEnvBindings: [], tfmCalls: [], tfmServiceDefs: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }
