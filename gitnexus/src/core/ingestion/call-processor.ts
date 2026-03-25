@@ -33,7 +33,7 @@ import { extractReturnTypeName, stripNullable } from './type-extractors/shared.j
 import { typeConfigs } from './type-extractors/index.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
 import type { SyntaxNode } from './utils.js';
-import { resolveJavaCallTarget, type JavaCallSite } from './java-call-resolver.js';
+import { resolveJavaCallTarget, type JavaCallSite, initJavaResolverStats, printJavaResolverStats } from './java-call-resolver.js';
 
 /** Per-file resolved type bindings for exported symbols.
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
@@ -288,6 +288,12 @@ export const processCalls = async (
   /** Phase 14 E3: cross-file RAW return types for for-loop element extraction. Keyed by filePath → Map<calleeName, rawReturnType>. */
   importedRawReturnTypesMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
 ): Promise<ExtractedHeritage[]> => {
+  // Initialize Java resolver performance tracking
+  if (process.env.GITNEXUS_DEBUG_JAVA) {
+    initJavaResolverStats();
+    console.log('[Java Performance] Performance tracking enabled');
+  }
+
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
   const pendingWrites: { receiverTypeName: string; propertyName: string; filePath: string; srcId: string }[] = [];
@@ -676,6 +682,11 @@ export const processCalls = async (
         `[ingestion] Skipped ${count} ${lang} file(s) in call processing — ${lang} parser not available.`
       );
     }
+  }
+
+  // Print Java resolver performance stats if tracking was enabled
+  if (process.env.GITNEXUS_DEBUG_JAVA) {
+    printJavaResolverStats();
   }
 
   return collectedHeritage;
@@ -1234,6 +1245,12 @@ export const processCallsFromExtracted = async (
   onProgress?: (current: number, total: number) => void,
   constructorBindings?: FileConstructorBindings[],
 ) => {
+  // Initialize Java resolver performance tracking
+  if (process.env.GITNEXUS_DEBUG_JAVA) {
+    initJavaResolverStats();
+    console.log('[Java Performance] Performance tracking enabled (worker mode)');
+  }
+
   // Scope-aware receiver types: keyed by filePath → "funcName\0varName" → typeName.
   // The scope dimension prevents collisions when two functions in the same file
   // have same-named locals pointing to different constructor types.
@@ -1363,6 +1380,11 @@ export const processCallsFromExtracted = async (
     }
 
     ctx.clearCache();
+  }
+
+  // Print Java resolver performance stats if tracking was enabled
+  if (process.env.GITNEXUS_DEBUG_JAVA) {
+    printJavaResolverStats();
   }
 
   onProgress?.(totalFiles, totalFiles);

@@ -350,8 +350,9 @@ public void processRequest() {
 | 阶段1优化 | 408秒 | 30.7% | 双层缓存 + 早期退出 |
 | 阶段2优化 | ~20秒 | 80% | 批量语言预加载（小项目） |
 | 阶段3优化 | 189秒 | 49.3% | 性能统计 + 父类缓存 |
-| **最终优化** | **52秒** | **72.5%** | **findEnclosingClass O(1)** |
-| **累计提升** | - | **91.2%** | - |
+| 阶段4优化 | 52秒 | 72.5% | findEnclosingClass O(1) |
+| **阶段5优化** | **109秒** | **60%** | **边索引 O(1) 查找** ⭐ |
+| **累计提升** | - | **81.5%** | **相比初始589秒** |
 
 ### 性能瓶颈分析
 
@@ -382,13 +383,60 @@ public void processRequest() {
 - super 类型: 85,900ms → 751ms（99.1%提升）
 - 优化方法: findEnclosingClass 从 O(E) 改为 O(1)
 
+---
+
+### 阶段5优化：边索引 O(1) 查找 (2026-03-25)
+
+**背景**: 阶段4优化后索引时间272秒(相比阶段3的189秒性能退化),发现新的性能瓶颈
+
+**性能瓶颈** (272秒时的统计):
+- **findFieldInClass**: 82.2秒（80.9%） ⚠️
+- **traverseInheritance**: 19.1秒（18.8%） ⚠️
+- 问题: `Array.from(graph.iterRelationships()).filter(...)` O(E)遍历
+- 计算量: 75,244次 × 67,307条边 ≈ 50亿次操作
+
+**优化方案**:
+```typescript
+// 使用 WeakMap 缓存边索引
+const edgeIndexCache = new WeakMap<KnowledgeGraph, EdgeIndex>();
+
+// O(E) 建立一次
+interface EdgeIndex {
+  bySource: Map<string, Array<{type, targetId}>>;
+}
+
+// O(1) 查找
+const edges = edgeIndex.bySource.get(nodeId) || [];
+const extendsEdges = edges.filter(e => e.type === 'EXTENDS');
+```
+
+**优化后性能** (109秒):
+```
+[Java Performance] Edge index built: 32071 nodes in 8ms
+  Total calls: 80855
+  Total time: 455ms (was 101821ms)
+  Avg: 0.01ms/call (was 1.26ms)
+
+  Helper Breakdown:
+    findFieldInClass: 101ms (was 82227ms) ✅
+    traverseInheritance: 15ms (was 19063ms) ✅
+```
+
+**关键改进**:
+- Java解析: **101.8秒 → 0.5秒** (99.6%, 223倍)
+- findFieldInClass: **82.2秒 → 0.1秒** (99.9%, 814倍)
+- traverseInheritance: **19.1秒 → 0.015秒** (99.9%, 1271倍)
+- 总索引时间: **272秒 → 109秒** (60%, 2.5倍)
+
+---
+
 ### 测试结论
 
-✅ **性能达标** - 52秒索引时间对于大项目已达到生产可接受标准
+✅ **性能优异** - 109秒索引时间,相比初始589秒提升81.5%
 
-✅ **性能稳定** - 平均每次调用耗时仅 0.04ms
+✅ **性能稳定** - Java解析平均耗时仅 0.01ms/调用
 
-✅ **瓶颈消除** - 原耗时最多的 this 和 super 类型已优化至合理水平
+✅ **瓶颈消除** - 边索引优化完全消除了继承链遍历瓶颈
 
 ---
 

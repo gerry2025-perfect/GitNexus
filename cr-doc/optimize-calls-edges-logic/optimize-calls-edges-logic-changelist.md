@@ -2,6 +2,62 @@
 
 ## 版本历史
 
+### v0.6 - 2026-03-25 边索引性能优化
+
+**背景**:
+- v0.5 重新实现后性能测试发现新的瓶颈
+- Java解析耗时101.8秒,占总索引时间272秒的37%
+- findFieldInClass 和 traverseInheritance 进行 O(E) 边遍历
+
+**性能分析**:
+- findFieldInClass: 82.2秒（80.9%时间）- 75,244次调用
+- traverseInheritance: 19.1秒（18.8%时间）- 10,936次调用
+- 问题: `Array.from(graph.iterRelationships()).filter(...)`
+- 计算量: 75,244 × 67,307 = 50亿次操作
+
+**优化方案**:
+1. 使用 WeakMap 缓存边索引: `Map<sourceId, Array<{type, targetId}>>`
+2. O(E) 建立一次索引,后续 O(1) 哈希查找
+3. 自动内存管理（WeakMap 在 graph 释放时自动清理）
+
+**修改文件**:
+
+1. `gitnexus/src/core/ingestion/java-call-resolver.ts` ✅
+   - ✅ 添加 `EdgeIndex` 接口定义
+   - ✅ 添加 `edgeIndexCache: WeakMap<KnowledgeGraph, EdgeIndex>`
+   - ✅ 实现 `getEdgeIndex()` 函数构建/获取边索引
+   - ✅ 修改 `findFieldInClass()` 使用边索引
+   - ✅ 修改 `resolveSuperCall()` 使用边索引
+   - ✅ 修改 `resolveInterfaceCall()` 使用边索引
+   - ✅ 添加性能追踪：
+     - `PerformanceStats` 接口扩展
+     - `initJavaResolverStats()` 初始化
+     - `getJavaResolverStats()` 获取统计
+     - `printJavaResolverStats()` 打印报告
+     - `trackTime()` 辅助函数
+
+2. `gitnexus/src/core/ingestion/call-processor.ts` ✅
+   - ✅ 导入性能追踪函数: `initJavaResolverStats`, `printJavaResolverStats`
+   - ✅ 在 `processCalls()` 开始时初始化性能统计
+   - ✅ 在 `processCalls()` 结束时打印性能报告
+   - ✅ 在 `processCallsFromExtracted()` 开始时初始化性能统计
+   - ✅ 在 `processCallsFromExtracted()` 结束时打印性能报告
+
+**性能改进**:
+- Java解析总耗时: **101.8秒 → 0.5秒** (99.6%提升, 223倍加速)
+- findFieldInClass: **82.2秒 → 0.1秒** (99.9%提升, 814倍加速)
+- traverseInheritance: **19.1秒 → 0.015秒** (99.9%提升, 1271倍加速)
+- 总索引时间: **272秒 → 109秒** (60%提升, 2.5倍加速)
+- 平均每调用: **1.26ms → 0.01ms** (99.2%提升)
+
+**实现特点**:
+- ✅ WeakMap 自动内存管理
+- ✅ 索引构建仅8ms
+- ✅ 详细性能追踪（类型分解 + 辅助函数分解）
+- ✅ 复杂度从 O(E) 降至 O(1)
+
+---
+
 ### v0.5 - 2026-03-25 重新实现（代码丢失后恢复）
 
 **背景**:

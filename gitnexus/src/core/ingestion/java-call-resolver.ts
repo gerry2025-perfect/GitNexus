@@ -18,6 +18,161 @@ import type { ASTCache } from './ast-cache.js';
 import type Parser from 'tree-sitter';
 import type { ImportMap } from './resolution-context.js';
 
+// ── Edge Index Cache ────────────────────────────────────────────────
+
+/**
+ * Edge index for O(1) relationship lookup by sourceId and type.
+ * Replaces O(E) Array.from(graph.iterRelationships()).filter(...) pattern.
+ */
+interface EdgeIndex {
+  bySource: Map<string, Array<{ type: string; targetId: string }>>;
+}
+
+/**
+ * WeakMap cache: graph → EdgeIndex
+ * Automatically garbage collected when graph is released.
+ */
+const edgeIndexCache = new WeakMap<KnowledgeGraph, EdgeIndex>();
+
+/**
+ * Build or retrieve cached edge index for a graph.
+ * Cost: O(E) once per graph, then O(1) lookups.
+ */
+function getEdgeIndex(graph: KnowledgeGraph): EdgeIndex {
+  let index = edgeIndexCache.get(graph);
+  if (index) return index;
+
+  const start = performance.now();
+  const bySource = new Map<string, Array<{ type: string; targetId: string }>>();
+
+  for (const rel of graph.iterRelationships()) {
+    if (!bySource.has(rel.sourceId)) {
+      bySource.set(rel.sourceId, []);
+    }
+    bySource.get(rel.sourceId)!.push({ type: rel.type, targetId: rel.targetId });
+  }
+
+  index = { bySource };
+  edgeIndexCache.set(graph, index);
+
+  const elapsed = performance.now() - start;
+  if (process.env.GITNEXUS_DEBUG_JAVA) {
+    console.log(`[Java Performance] Edge index built: ${bySource.size} nodes indexed in ${elapsed.toFixed(0)}ms`);
+  }
+
+  return index;
+}
+
+// ── Performance Tracking ────────────────────────────────────────────
+
+interface PerformanceStats {
+  totalCalls: number;
+  resolvedCalls: number;
+  unresolvedCalls: number;
+  typeBreakdown: {
+    methodInstance: { count: number; time: number };
+    classInstance: { count: number; time: number };
+    static: { count: number; time: number };
+    this: { count: number; time: number };
+    super: { count: number; time: number };
+    interface: { count: number; time: number };
+  };
+  helperBreakdown: {
+    findEnclosingClass: { count: number; time: number };
+    findFieldInClass: { count: number; time: number };
+    extractLocalVariables: { count: number; time: number };
+    findClassByTypeName: { count: number; time: number };
+    findMethodInClass: { count: number; time: number };
+    traverseInheritance: { count: number; time: number };
+  };
+}
+
+let perfStats: PerformanceStats | null = null;
+
+export function initJavaResolverStats(): void {
+  perfStats = {
+    totalCalls: 0,
+    resolvedCalls: 0,
+    unresolvedCalls: 0,
+    typeBreakdown: {
+      methodInstance: { count: 0, time: 0 },
+      classInstance: { count: 0, time: 0 },
+      static: { count: 0, time: 0 },
+      this: { count: 0, time: 0 },
+      super: { count: 0, time: 0 },
+      interface: { count: 0, time: 0 },
+    },
+    helperBreakdown: {
+      findEnclosingClass: { count: 0, time: 0 },
+      findFieldInClass: { count: 0, time: 0 },
+      extractLocalVariables: { count: 0, time: 0 },
+      findClassByTypeName: { count: 0, time: 0 },
+      findMethodInClass: { count: 0, time: 0 },
+      traverseInheritance: { count: 0, time: 0 },
+    },
+  };
+}
+
+export function getJavaResolverStats(): PerformanceStats | null {
+  return perfStats;
+}
+
+export function resetJavaResolverStats(): void {
+  perfStats = null;
+}
+
+export function printJavaResolverStats(): void {
+  if (!perfStats) {
+    console.log('[Java Performance] Stats not initialized');
+    return;
+  }
+
+  const totalTime = Object.values(perfStats.typeBreakdown).reduce((sum, t) => sum + t.time, 0);
+  const avgPerCall = perfStats.totalCalls > 0 ? totalTime / perfStats.totalCalls : 0;
+
+  console.log('\n' + '='.repeat(80));
+  console.log('[Java Performance Breakdown]');
+  console.log('='.repeat(80));
+  console.log(`  Total calls processed: ${perfStats.totalCalls}`);
+  console.log(`  Resolved: ${perfStats.resolvedCalls} (${((perfStats.resolvedCalls / perfStats.totalCalls) * 100).toFixed(1)}%)`);
+  console.log(`  Unresolved: ${perfStats.unresolvedCalls} (${((perfStats.unresolvedCalls / perfStats.totalCalls) * 100).toFixed(1)}%)`);
+  console.log(`  Total processing time: ${totalTime.toFixed(0)}ms`);
+  console.log(`  Avg per call: ${avgPerCall.toFixed(2)}ms`);
+
+  console.log('\n  Resolve Type Breakdown:');
+  for (const [type, stats] of Object.entries(perfStats.typeBreakdown)) {
+    if (stats.count > 0) {
+      const avgTime = stats.time / stats.count;
+      const pct = totalTime > 0 ? (stats.time / totalTime * 100).toFixed(1) : '0.0';
+      console.log(`    ${type.padEnd(16)}: ${stats.time.toFixed(0).padStart(6)}ms (${pct.padStart(5)}%) - ${stats.count} calls, avg ${avgTime.toFixed(2)}ms/call`);
+    }
+  }
+
+  const helperTotalTime = Object.values(perfStats.helperBreakdown).reduce((sum, h) => sum + h.time, 0);
+  console.log('\n  Helper Function Breakdown:');
+  for (const [helper, stats] of Object.entries(perfStats.helperBreakdown)) {
+    if (stats.count > 0) {
+      const avgTime = stats.time / stats.count;
+      const pct = helperTotalTime > 0 ? (stats.time / helperTotalTime * 100).toFixed(1) : '0.0';
+      console.log(`    ${helper.padEnd(24)}: ${stats.time.toFixed(0).padStart(6)}ms (${pct.padStart(5)}%) - ${stats.count} calls, avg ${avgTime.toFixed(2)}ms/call`);
+    }
+  }
+  console.log('='.repeat(80) + '\n');
+}
+
+function trackTime<T>(category: keyof PerformanceStats['helperBreakdown'], fn: () => T): T {
+  if (!perfStats) return fn();
+
+  const start = performance.now();
+  const result = fn();
+  const elapsed = performance.now() - start;
+
+  perfStats.helperBreakdown[category].count++;
+  perfStats.helperBreakdown[category].time += elapsed;
+
+  return result;
+}
+
 // ── Interfaces ──────────────────────────────────────────────────────
 
 /**
@@ -64,6 +219,10 @@ export const resolveJavaCallTarget = (
 ): JavaResolveResult | null => {
   const { calledName, objectName, currentFile, enclosingFunctionId } = call;
 
+  if (perfStats) {
+    perfStats.totalCalls++;
+  }
+
   // Debug logging
   if (process.env.GITNEXUS_DEBUG_JAVA) {
     console.log(`[Java Resolver] Processing call: ${objectName ? objectName + '.' : ''}${calledName} in ${currentFile}`);
@@ -72,59 +231,128 @@ export const resolveJavaCallTarget = (
   // 1. methodInstance: obj.method() - obj is a local variable/parameter
   // Requires AST parsing - skip if AST not available
   if (objectName && astCache) {
+    const start = performance.now();
     const result = resolveMethodInstance(calledName, objectName, currentFile, enclosingFunctionId, graph, symbolTable, astCache);
+    const elapsed = performance.now() - start;
+
+    if (perfStats) {
+      perfStats.typeBreakdown.methodInstance.time += elapsed;
+    }
+
     if (result) {
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as methodInstance`);
+      if (perfStats) {
+        perfStats.typeBreakdown.methodInstance.count++;
+        perfStats.resolvedCalls++;
+      }
+      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as methodInstance (${elapsed.toFixed(2)}ms)`);
       return result;
     }
   }
 
   // 2. classInstance: obj.method() - obj is a class field
   if (objectName) {
+    const start = performance.now();
     const result = resolveClassInstance(calledName, objectName, currentFile, enclosingFunctionId, graph, symbolTable);
+    const elapsed = performance.now() - start;
+
+    if (perfStats) {
+      perfStats.typeBreakdown.classInstance.time += elapsed;
+    }
+
     if (result) {
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as classInstance`);
+      if (perfStats) {
+        perfStats.typeBreakdown.classInstance.count++;
+        perfStats.resolvedCalls++;
+      }
+      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as classInstance (${elapsed.toFixed(2)}ms)`);
       return result;
     }
   }
 
   // 3. static: ClassName.method() or full.path.ClassName.method()
   if (objectName && isCapitalized(objectName)) {
+    const start = performance.now();
     const result = resolveStaticCall(calledName, objectName, currentFile, graph, symbolTable, importMap);
+    const elapsed = performance.now() - start;
+
+    if (perfStats) {
+      perfStats.typeBreakdown.static.time += elapsed;
+    }
+
     if (result) {
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as static`);
+      if (perfStats) {
+        perfStats.typeBreakdown.static.count++;
+        perfStats.resolvedCalls++;
+      }
+      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as static (${elapsed.toFixed(2)}ms)`);
       return result;
     }
   }
 
   // 4. this: method() - current class method
   if (!objectName) {
+    const start = performance.now();
     const result = resolveThisCall(calledName, currentFile, enclosingFunctionId, graph, symbolTable);
+    const elapsed = performance.now() - start;
+
+    if (perfStats) {
+      perfStats.typeBreakdown.this.time += elapsed;
+    }
+
     if (result) {
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as this`);
+      if (perfStats) {
+        perfStats.typeBreakdown.this.count++;
+        perfStats.resolvedCalls++;
+      }
+      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as this (${elapsed.toFixed(2)}ms)`);
       return result;
     }
   }
 
   // 5. super: method() - parent class method
   if (!objectName) {
+    const start = performance.now();
     const result = resolveSuperCall(calledName, currentFile, enclosingFunctionId, graph, symbolTable);
+    const elapsed = performance.now() - start;
+
+    if (perfStats) {
+      perfStats.typeBreakdown.super.time += elapsed;
+    }
+
     if (result) {
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as super`);
+      if (perfStats) {
+        perfStats.typeBreakdown.super.count++;
+        perfStats.resolvedCalls++;
+      }
+      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as super (${elapsed.toFixed(2)}ms)`);
       return result;
     }
   }
 
   // 6. interface: method() - interface method
   if (!objectName) {
+    const start = performance.now();
     const result = resolveInterfaceCall(calledName, currentFile, enclosingFunctionId, graph, symbolTable);
+    const elapsed = performance.now() - start;
+
+    if (perfStats) {
+      perfStats.typeBreakdown.interface.time += elapsed;
+    }
+
     if (result) {
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as interface`);
+      if (perfStats) {
+        perfStats.typeBreakdown.interface.count++;
+        perfStats.resolvedCalls++;
+      }
+      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as interface (${elapsed.toFixed(2)}ms)`);
       return result;
     }
   }
 
   // Unable to resolve - return null
+  if (perfStats) {
+    perfStats.unresolvedCalls++;
+  }
   if (process.env.GITNEXUS_DEBUG_JAVA) {
     console.log(`  ✗ Unable to resolve`);
   }
@@ -160,18 +388,24 @@ const resolveMethodInstance = (
   if (!tree) return null;
 
   // Extract local variables from method body
-  const locals = extractLocalVariables(tree.rootNode, enclosingFunctionId, currentFile);
+  const locals = trackTime('extractLocalVariables', () =>
+    extractLocalVariables(tree.rootNode, enclosingFunctionId, currentFile)
+  );
 
   // Find variable matching objectName
   const variable = locals.find(v => v.name === objectName);
   if (!variable) return null;
 
   // Find class by type name
-  const classDef = findClassByTypeName(variable.typeName, currentFile, symbolTable);
+  const classDef = trackTime('findClassByTypeName', () =>
+    findClassByTypeName(variable.typeName, currentFile, symbolTable)
+  );
   if (!classDef) return null;
 
   // Find method in class
-  const methodDef = symbolTable.findMethodInClass(classDef.nodeId, calledName);
+  const methodDef = trackTime('findMethodInClass', () =>
+    symbolTable.findMethodInClass(classDef.nodeId, calledName)
+  );
   if (!methodDef) return null;
 
   return {
@@ -360,11 +594,15 @@ const resolveClassInstance = (
   symbolTable: SymbolTable,
 ): JavaResolveResult | null => {
   // Find the enclosing class
-  const enclosingClass = findEnclosingClass(enclosingFunctionId, currentFile, graph);
+  const enclosingClass = trackTime('findEnclosingClass', () =>
+    findEnclosingClass(enclosingFunctionId, currentFile, graph)
+  );
   if (!enclosingClass) return null;
 
   // Find field in class (supports inheritance)
-  const fieldDef = findFieldInClass(enclosingClass.id, objectName, graph, symbolTable);
+  const fieldDef = trackTime('findFieldInClass', () =>
+    findFieldInClass(enclosingClass.id, objectName, graph, symbolTable)
+  );
   if (!fieldDef || !fieldDef.declaredType) return null;
 
   // Extract type name from declared type (strip generics if present)
@@ -372,11 +610,15 @@ const resolveClassInstance = (
   if (!typeName) return null;
 
   // Find class by type name
-  const classDef = findClassByTypeName(typeName, currentFile, symbolTable);
+  const classDef = trackTime('findClassByTypeName', () =>
+    findClassByTypeName(typeName, currentFile, symbolTable)
+  );
   if (!classDef) return null;
 
   // Find method in class
-  const methodDef = symbolTable.findMethodInClass(classDef.nodeId, calledName);
+  const methodDef = trackTime('findMethodInClass', () =>
+    symbolTable.findMethodInClass(classDef.nodeId, calledName)
+  );
   if (!methodDef) return null;
 
   return {
@@ -393,6 +635,7 @@ const resolveClassInstance = (
 /**
  * Find a field in a class, searching current class and parent classes.
  * Uses SymbolTable's lookupFieldByOwner for O(1) lookup.
+ * Uses edge index for O(1) inheritance traversal (replaces O(E) iterRelationships).
  */
 const findFieldInClass = (
   classId: string,
@@ -403,6 +646,9 @@ const findFieldInClass = (
   // Try current class first
   const fieldDef = symbolTable.lookupFieldByOwner(classId, fieldName);
   if (fieldDef) return fieldDef;
+
+  // Get edge index for O(1) relationship lookup
+  const edgeIndex = getEdgeIndex(graph);
 
   // Search in parent classes
   const visited = new Set<string>();
@@ -415,10 +661,9 @@ const findFieldInClass = (
     if (visited.has(currentClassId)) continue;
     visited.add(currentClassId);
 
-    // Find EXTENDS edges
-    const extendsEdges = Array.from(graph.iterRelationships()).filter(
-      rel => rel.sourceId === currentClassId && rel.type === 'EXTENDS'
-    );
+    // Find EXTENDS edges using index (O(1) vs O(E))
+    const edges = edgeIndex.bySource.get(currentClassId) || [];
+    const extendsEdges = edges.filter(e => e.type === 'EXTENDS');
 
     for (const edge of extendsEdges) {
       const parentClassId = edge.targetId;
@@ -491,7 +736,9 @@ const resolveStaticCall = (
 
   // Try to find the method in each candidate class
   for (const classDef of classCandidates) {
-    const methodDef = symbolTable.findMethodInClass(classDef.nodeId, calledName);
+    const methodDef = trackTime('findMethodInClass', () =>
+      symbolTable.findMethodInClass(classDef.nodeId, calledName)
+    );
     if (methodDef) {
       return {
         nodeId: methodDef.nodeId,
@@ -522,11 +769,15 @@ const resolveThisCall = (
   symbolTable: SymbolTable,
 ): JavaResolveResult | null => {
   // Find the enclosing class
-  const enclosingClass = findEnclosingClass(enclosingFunctionId, currentFile, graph);
+  const enclosingClass = trackTime('findEnclosingClass', () =>
+    findEnclosingClass(enclosingFunctionId, currentFile, graph)
+  );
   if (!enclosingClass) return null;
 
   // Find method in current class
-  const methodDef = symbolTable.findMethodInClass(enclosingClass.id, calledName);
+  const methodDef = trackTime('findMethodInClass', () =>
+    symbolTable.findMethodInClass(enclosingClass.id, calledName)
+  );
   if (!methodDef) return null;
 
   return {
@@ -556,46 +807,54 @@ const resolveSuperCall = (
   symbolTable: SymbolTable,
 ): JavaResolveResult | null => {
   // Find the enclosing class
-  const enclosingClass = findEnclosingClass(enclosingFunctionId, currentFile, graph);
+  const enclosingClass = trackTime('findEnclosingClass', () =>
+    findEnclosingClass(enclosingFunctionId, currentFile, graph)
+  );
   if (!enclosingClass) return null;
 
   // Traverse parent class chain
-  const visited = new Set<string>();
-  const queue: string[] = [enclosingClass.id];
+  return trackTime('traverseInheritance', () => {
+    // Get edge index for O(1) relationship lookup
+    const edgeIndex = getEdgeIndex(graph);
 
-  while (queue.length > 0) {
-    const currentClassId = queue.shift()!;
+    const visited = new Set<string>();
+    const queue: string[] = [enclosingClass.id];
 
-    // Cycle detection
-    if (visited.has(currentClassId)) continue;
-    visited.add(currentClassId);
+    while (queue.length > 0) {
+      const currentClassId = queue.shift()!;
 
-    // Find EXTENDS edges from this class
-    const extendsEdges = Array.from(graph.iterRelationships()).filter(
-      rel => rel.sourceId === currentClassId && rel.type === 'EXTENDS'
-    );
+      // Cycle detection
+      if (visited.has(currentClassId)) continue;
+      visited.add(currentClassId);
 
-    for (const edge of extendsEdges) {
-      const parentClassId = edge.targetId;
+      // Find EXTENDS edges using index (O(1) vs O(E))
+      const edges = edgeIndex.bySource.get(currentClassId) || [];
+      const extendsEdges = edges.filter(e => e.type === 'EXTENDS');
 
-      // Try to find method in parent class
-      const methodDef = symbolTable.findMethodInClass(parentClassId, calledName);
-      if (methodDef) {
-        return {
-          nodeId: methodDef.nodeId,
-          confidence: 0.85,
-          reason: 'super',
-          filePath: methodDef.filePath,
-          returnType: methodDef.returnType,
-        };
+      for (const edge of extendsEdges) {
+        const parentClassId = edge.targetId;
+
+        // Try to find method in parent class
+        const methodDef = trackTime('findMethodInClass', () =>
+          symbolTable.findMethodInClass(parentClassId, calledName)
+        );
+        if (methodDef) {
+          return {
+            nodeId: methodDef.nodeId,
+            confidence: 0.85,
+            reason: 'super' as const,
+            filePath: methodDef.filePath,
+            returnType: methodDef.returnType,
+          };
+        }
+
+        // Continue searching in grandparent classes
+        queue.push(parentClassId);
       }
-
-      // Continue searching in grandparent classes
-      queue.push(parentClassId);
     }
-  }
 
-  return null;
+    return null;
+  });
 };
 
 /**
@@ -616,46 +875,54 @@ const resolveInterfaceCall = (
   symbolTable: SymbolTable,
 ): JavaResolveResult | null => {
   // Find the enclosing class
-  const enclosingClass = findEnclosingClass(enclosingFunctionId, currentFile, graph);
+  const enclosingClass = trackTime('findEnclosingClass', () =>
+    findEnclosingClass(enclosingFunctionId, currentFile, graph)
+  );
   if (!enclosingClass) return null;
 
   // Traverse interface chain
-  const visited = new Set<string>();
-  const queue: string[] = [enclosingClass.id];
+  return trackTime('traverseInheritance', () => {
+    // Get edge index for O(1) relationship lookup
+    const edgeIndex = getEdgeIndex(graph);
 
-  while (queue.length > 0) {
-    const currentClassId = queue.shift()!;
+    const visited = new Set<string>();
+    const queue: string[] = [enclosingClass.id];
 
-    // Cycle detection
-    if (visited.has(currentClassId)) continue;
-    visited.add(currentClassId);
+    while (queue.length > 0) {
+      const currentClassId = queue.shift()!;
 
-    // Find IMPLEMENTS edges from this class
-    const implementsEdges = Array.from(graph.iterRelationships()).filter(
-      rel => rel.sourceId === currentClassId && rel.type === 'IMPLEMENTS'
-    );
+      // Cycle detection
+      if (visited.has(currentClassId)) continue;
+      visited.add(currentClassId);
 
-    for (const edge of implementsEdges) {
-      const interfaceId = edge.targetId;
+      // Find IMPLEMENTS edges using index (O(1) vs O(E))
+      const edges = edgeIndex.bySource.get(currentClassId) || [];
+      const implementsEdges = edges.filter(e => e.type === 'IMPLEMENTS');
 
-      // Try to find method in interface
-      const methodDef = symbolTable.findMethodInClass(interfaceId, calledName);
-      if (methodDef) {
-        return {
-          nodeId: methodDef.nodeId,
-          confidence: 0.85,
-          reason: 'interface',
-          filePath: methodDef.filePath,
-          returnType: methodDef.returnType,
-        };
+      for (const edge of implementsEdges) {
+        const interfaceId = edge.targetId;
+
+        // Try to find method in interface
+        const methodDef = trackTime('findMethodInClass', () =>
+          symbolTable.findMethodInClass(interfaceId, calledName)
+        );
+        if (methodDef) {
+          return {
+            nodeId: methodDef.nodeId,
+            confidence: 0.85,
+            reason: 'interface' as const,
+            filePath: methodDef.filePath,
+            returnType: methodDef.returnType,
+          };
+        }
+
+        // Continue searching in parent interfaces (interfaces can extend other interfaces)
+        queue.push(interfaceId);
       }
-
-      // Continue searching in parent interfaces (interfaces can extend other interfaces)
-      queue.push(interfaceId);
     }
-  }
 
-  return null;
+    return null;
+  });
 };
 
 // ── Helper Functions ────────────────────────────────────────────────
