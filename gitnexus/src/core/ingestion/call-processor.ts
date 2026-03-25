@@ -33,6 +33,7 @@ import { extractReturnTypeName, stripNullable } from './type-extractors/shared.j
 import { typeConfigs } from './type-extractors/index.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
 import type { SyntaxNode } from './utils.js';
+import { resolveJavaCallTarget, type JavaCallSite } from './java-call-resolver.js';
 
 /** Per-file resolved type bindings for exported symbols.
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
@@ -596,13 +597,46 @@ export const processCalls = async (
         ? { callNode, inferLiteralType: langConfig.inferLiteralType }
         : undefined;
 
-      const resolved = resolveCallTarget({
-        calledName,
-        argCount: countCallArguments(callNode),
-        callForm,
-        receiverTypeName,
-        receiverName,
-      }, file.path, ctx, hints);
+      let resolved: ResolveResult | null = null;
+
+      // Java-specific resolution: Use specialized resolver for 6 precise call types
+      // (this, static, methodInstance, classInstance, super, interface)
+      if (lang === 'java') {
+        const javaCallSite: JavaCallSite = {
+          calledName,
+          objectName: receiverName,
+          currentFile: file.path,
+          enclosingFunctionId: enclosingFuncId,
+          callNode,
+        };
+        const javaResolved = resolveJavaCallTarget(
+          javaCallSite,
+          graph,
+          ctx.symbols,
+          ctx.importMap,
+          astCache,
+        );
+        if (javaResolved) {
+          resolved = {
+            nodeId: javaResolved.nodeId,
+            confidence: javaResolved.confidence,
+            reason: javaResolved.reason,
+            filePath: javaResolved.filePath,
+            returnType: javaResolved.returnType,
+          };
+        }
+      }
+
+      // Fallback to generic resolution for non-Java or when Java resolver fails
+      if (!resolved) {
+        resolved = resolveCallTarget({
+          calledName,
+          argCount: countCallArguments(callNode),
+          callForm,
+          receiverTypeName,
+          receiverName,
+        }, file.path, ctx, hints);
+      }
 
       if (!resolved) return;
       const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
@@ -655,6 +689,7 @@ interface ResolveResult {
   confidence: number;
   reason: string;
   returnType?: string;
+  filePath: string; // Target symbol's file path (for cross-language check)
 }
 
 const CALLABLE_SYMBOL_TYPES = new Set([
@@ -707,7 +742,18 @@ const toResolveResult = (
   confidence: TIER_CONFIDENCE[tier],
   reason: tier === 'same-file' ? 'same-file' : tier === 'import-scoped' ? 'import-resolved' : 'global',
   returnType: definition.returnType,
+  filePath: definition.filePath,
 });
+
+/**
+ * Check if a cross-language call should be rejected.
+ * Returns true if the call is from a different language file.
+ */
+const isCrossLanguageCall = (sourceFile: string, targetFile: string): boolean => {
+  const sourceLanguage = getLanguageFromFilename(sourceFile);
+  const targetLanguage = getLanguageFromFilename(targetFile);
+  return !!(sourceLanguage && targetLanguage && sourceLanguage !== targetLanguage);
+};
 
 
 /** Optional hints for overload disambiguation via argument literal types.
@@ -819,6 +865,8 @@ const tryOverloadDisambiguation = (
  * E. Apply overload disambiguation via argument literal types (when available)
  *
  * If filtering still leaves multiple candidates, refuse to emit a CALLS edge.
+ *
+ * Note: 'global' tier (fuzzy-global) is rejected to avoid low-quality edges.
  */
 const resolveCallTarget = (
   call: Pick<ExtractedCall, 'calledName' | 'argCount' | 'callForm' | 'receiverTypeName' | 'receiverName'>,
@@ -828,6 +876,12 @@ const resolveCallTarget = (
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
+
+  // Reject 'global' tier to avoid fuzzy-global low-quality edges
+  // Only same-file (0.95) and import-scoped (0.9) are kept for high confidence
+  if (tiered.tier === 'global') {
+    return null;
+  }
 
   let filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, call.callForm);
 
@@ -890,6 +944,7 @@ const resolveCallTarget = (
       // D3. File-based: prefer candidates whose filePath matches the resolved type's file
       const fileFiltered = methodPool.filter(c => typeFiles.has(c.filePath));
       if (fileFiltered.length === 1) {
+        if (isCrossLanguageCall(currentFile, fileFiltered[0].filePath)) return null;
         return toResolveResult(fileFiltered[0], tiered.tier);
       }
 
@@ -897,13 +952,17 @@ const resolveCallTarget = (
       const pool = fileFiltered.length > 0 ? fileFiltered : methodPool;
       const ownerFiltered = pool.filter(c => c.ownerId && typeNodeIds.has(c.ownerId));
       if (ownerFiltered.length === 1) {
+        if (isCrossLanguageCall(currentFile, ownerFiltered[0].filePath)) return null;
         return toResolveResult(ownerFiltered[0], tiered.tier);
       }
       // E. Try overload disambiguation on the narrowed pool
       if ((fileFiltered.length > 1 || ownerFiltered.length > 1) && overloadHints) {
         const overloadPool = ownerFiltered.length > 1 ? ownerFiltered : fileFiltered;
         const disambiguated = tryOverloadDisambiguation(overloadPool, overloadHints);
-        if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
+        if (disambiguated) {
+          if (isCrossLanguageCall(currentFile, disambiguated.filePath)) return null;
+          return toResolveResult(disambiguated, tiered.tier);
+        }
       }
       if (fileFiltered.length > 1 || ownerFiltered.length > 1) return null;
     }
@@ -914,7 +973,10 @@ const resolveCallTarget = (
   // Only available on sequential path (has AST); worker path falls through gracefully.
   if (filteredCandidates.length > 1 && overloadHints) {
     const disambiguated = tryOverloadDisambiguation(filteredCandidates, overloadHints);
-    if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
+    if (disambiguated) {
+      if (isCrossLanguageCall(currentFile, disambiguated.filePath)) return null;
+      return toResolveResult(disambiguated, tiered.tier);
+    }
   }
 
   if (filteredCandidates.length !== 1) {
@@ -926,11 +988,15 @@ const resolveCallTarget = (
       const allSameType = filteredCandidates.every(c => c.type === filteredCandidates[0].type);
       if (allSameType && (filteredCandidates[0].type === 'Class' || filteredCandidates[0].type === 'Struct')) {
         const sorted = [...filteredCandidates].sort((a, b) => a.filePath.length - b.filePath.length);
+        if (isCrossLanguageCall(currentFile, sorted[0].filePath)) return null;
         return toResolveResult(sorted[0], tiered.tier);
       }
     }
     return null;
   }
+
+  // Cross-language check: reject calls from different language files
+  if (isCrossLanguageCall(currentFile, filteredCandidates[0].filePath)) return null;
 
   return toResolveResult(filteredCandidates[0], tiered.tier);
 };
@@ -1252,16 +1318,47 @@ export const processCallsFromExtracted = async (
       }
 
       const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx);
-      if (!resolved) continue;
 
-      const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${resolved.nodeId}`);
+      // If generic resolver fails for Java files, try Java-specific resolver
+      // (worker mode doesn't have AST, so methodInstance won't work, but other types will)
+      let javaResolved: ResolveResult | null = null;
+      if (!resolved) {
+        const lang = getLanguageFromFilename(effectiveCall.filePath);
+        if (lang === 'java') {
+          // Extract enclosingFunctionId from sourceId (format: "Method:filePath:className:methodName" or "File:filePath")
+          const enclosingFunctionId = effectiveCall.sourceId.startsWith('Method:') ? effectiveCall.sourceId : null;
+
+          const javaCallSite: JavaCallSite = {
+            calledName: effectiveCall.calledName,
+            objectName: effectiveCall.receiverName || null,
+            currentFile: effectiveCall.filePath,
+            enclosingFunctionId,
+          };
+
+          const javaResult = resolveJavaCallTarget(javaCallSite, graph, ctx.symbols, ctx.importMap, null as any);
+          if (javaResult) {
+            javaResolved = {
+              nodeId: javaResult.nodeId,
+              confidence: javaResult.confidence,
+              reason: javaResult.reason,
+              filePath: javaResult.filePath,
+              returnType: javaResult.returnType,
+            };
+          }
+        }
+      }
+
+      const finalResolved = resolved || javaResolved;
+      if (!finalResolved) continue;
+
+      const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${finalResolved.nodeId}`);
       graph.addRelationship({
         id: relId,
         sourceId: effectiveCall.sourceId,
-        targetId: resolved.nodeId,
+        targetId: finalResolved.nodeId,
         type: 'CALLS',
-        confidence: resolved.confidence,
-        reason: resolved.reason,
+        confidence: finalResolved.confidence,
+        reason: finalResolved.reason,
       });
     }
 
