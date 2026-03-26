@@ -299,7 +299,8 @@ export const analyzeCommand = async (
   const t0Lbug = Date.now();
   await initLbug(lbugPath);
   let lbugMsgCount = 0;
-  const lbugResult = await loadGraphToLbug(pipelineResult.graph, pipelineResult.repoPath, storagePath, (msg) => {
+  // Use roots array for multi-root support in CSV generation
+  const lbugResult = await loadGraphToLbug(pipelineResult.graph, roots.length > 1 ? roots : repoPath, storagePath, (msg) => {
     lbugMsgCount++;
     const progress = Math.min(84, 60 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 24));
     updateBar(progress, msg);

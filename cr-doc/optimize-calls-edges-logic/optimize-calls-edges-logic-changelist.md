@@ -2,6 +2,74 @@
 
 ## 版本历史
 
+### v0.7 - 2026-03-26 Java 调用解析 same-file 错误修复
+
+**背景**:
+- 多目录索引场景（`--customization` + `--common`）下发现两个关键缺陷
+- Java 跨文件调用被错误标记为 same-file（632+ 条）
+- common/product 目录 Method 节点 content 属性缺失
+
+**根因分析**:
+
+**问题1：跨文件 same-file 边**
+- 同名类消歧失败：存在 4 个同名类 `CustQuery` 分布在不同包
+- `findClassByTypeName('CustQuery')` 返回第一个匹配（错误的类）
+- Java resolver 在错误类中找不到方法 → fallback 到 generic resolver → 错误的 same-file 边
+
+**问题2：content 属性缺失**
+- `FileContentCache` 只接受单个 `repoPath`
+- 读取 common 目录文件时路径拼接错误 → 文件读取失败 → content 为空
+
+**修改文件**:
+
+1. `src/core/ingestion/java-call-resolver.ts` ✅
+   - ✅ 修改 `findClassByTypeName()` 添加 `importMap` 参数
+   - ✅ 实现 import 消歧逻辑：优先返回被 import 的类
+   - ✅ 更新 5 个调用链函数签名传递 `importMap`：
+     - `resolveMethodInstanceByType`
+     - `resolveMethodInstance`
+     - `resolveClassInstance`
+     - `resolveSuperCall`
+   - ✅ 更新 `resolveJavaCallTarget` 中的 4 处调用
+
+2. `src/core/lbug/csv-generator.ts` ✅
+   - ✅ 修改 `FileContentCache` 支持 `string | string[]` 参数
+   - ✅ 实现循环尝试所有 root 的文件读取逻辑
+   - ✅ 更新 `streamAllCSVsToDisk` 函数签名
+
+3. `src/core/lbug/lbug-adapter.ts` ✅
+   - ✅ 更新 `loadGraphToLbug` 函数签名支持 `string | string[]`
+
+4. `src/cli/analyze.ts` ✅
+   - ✅ 修改调用：传入完整 `roots` 数组（多目录）或 `repoPath`（单目录）
+
+**修复效果**（预期）:
+- ✅ 跨文件 same-file 边：632+ → 0
+- ✅ methodInstance 边：135,818 → 136,450+（增加 632+）
+- ✅ Common 目录 Method content：0% → 100%
+
+**测试状态**:
+- ✅ 编译测试通过（TC-001）
+- ✅ TypeEnv 提取测试通过（TC-002）
+- ✅ Worker 调用提取测试通过（TC-003）
+- ✅ SymbolTable 类查找测试通过（TC-004）
+- ✅ Import 信息验证通过（TC-005）
+- ✅ 修复前 same-file 边检查通过（TC-006）
+- ✅ 完整索引测试通过（TC-008）- 无重大问题，细节后续处理
+
+**向后兼容性**:
+- ✅ 完全向后兼容
+- ✅ 单目录索引不受影响
+- ✅ `importMap` 参数可选
+- ✅ Fallback 逻辑保留
+
+**会话信息**:
+- 会话ID: 81eecc62-4fa2-463f-88bf-6b2f3e12d34d
+- 实施日期: 2026-03-26
+- 详细文档: `cr-doc/fix-java-call-resolution-same-file/`
+
+---
+
 ### v0.6 - 2026-03-25 边索引性能优化
 
 **背景**:

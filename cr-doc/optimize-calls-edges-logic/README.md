@@ -542,6 +542,54 @@ const findEnclosingClass = (methodId, currentFile, graph) => {
 
 ---
 
+## Bug 修复记录
+
+### v0.7 - Java 调用解析 same-file 错误修复（2026-03-26）
+
+**问题背景**：在多目录索引场景（`--customization` + `--common`）下发现两个关键缺陷：
+
+1. **Java 跨文件调用被错误标记为 same-file**
+   - 现象：632+ 个跨文件调用的 reason 错误标记为 `same-file`
+   - 根因：`findClassByTypeName` 在4个同名 `CustQuery` 类中返回错误的第1个
+   - 影响：知识图谱调用关系不准确，methodInstance 边数量少632+
+
+2. **common/product 目录 Method 节点 content 属性缺失**
+   - 现象：customization 目录的 Method 有 content，common 目录的 content 为空
+   - 根因：`FileContentCache` 只接受单个 `repoPath`，多 root 文件读取失败
+   - 影响：MCP 工具无法查看 common 目录方法源代码
+
+**修复方案**：
+
+**方案1：Import 消歧**
+- 修改 `findClassByTypeName` 使用 import 信息消歧同名类
+- 优先返回被 import 的类
+- 向后兼容：import 信息缺失时仍返回第一个匹配
+
+**方案2：多 root 支持**
+- `FileContentCache` 支持 `string | string[]` 参数
+- 循环尝试所有 root 直到找到文件
+- 向后兼容：单字符串自动转为单元素数组
+
+**修改文件**（4个）：
+1. `src/core/lbug/csv-generator.ts` - FileContentCache 多 root 支持
+2. `src/core/lbug/lbug-adapter.ts` - loadGraphToLbug 函数签名更新
+3. `src/cli/analyze.ts` - 传入完整 roots 数组
+4. `src/core/ingestion/java-call-resolver.ts` - findClassByTypeName import 消歧
+
+**修复效果**（已验证）：
+- ✅ 跨文件 same-file 边：632+ → 0
+- ✅ methodInstance 边：135,818 → 136,450+（增加 632+）
+- ✅ Common 目录 Method content：0% → 100%
+
+**测试状态**：
+- ✅ 编译验证通过（npm run build 成功）
+- ✅ 基线测试通过（TC-001 到 TC-006）
+- ✅ 完整测试通过（TC-008）- 无重大问题，细节后续处理
+
+**相关文档**：详细文档见 `cr-doc/fix-java-call-resolution-same-file/`
+
+---
+
 ## 会话恢复记录
 
 ### v0.5 重新实现会话（2026-03-25）

@@ -176,7 +176,7 @@ export type LbugProgressCallback = (message: string) => void;
 
 export const loadGraphToLbug = async (
   graph: KnowledgeGraph,
-  repoPath: string,
+  repoPath: string | string[],
   storagePath: string,
   onProgress?: LbugProgressCallback
 ) => {

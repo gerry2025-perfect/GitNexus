@@ -65,15 +65,17 @@ export const isBinaryContent = (content: string): boolean => {
  * LRU content cache — avoids re-reading the same source file for every
  * symbol defined in it. Sized generously so most files stay cached during
  * the single-pass node iteration.
+ *
+ * Multi-root support: Tries all root paths until file is found.
  */
 class FileContentCache {
   private cache = new Map<string, string>();
   private accessOrder: string[] = [];
   private maxSize: number;
-  private repoPath: string;
+  private roots: string[];
 
-  constructor(repoPath: string, maxSize: number = 3000) {
-    this.repoPath = repoPath;
+  constructor(repoPath: string | string[], maxSize: number = 3000) {
+    this.roots = Array.isArray(repoPath) ? repoPath : [repoPath];
     this.maxSize = maxSize;
   }
 
@@ -89,15 +91,23 @@ class FileContentCache {
       }
       return cached;
     }
-    try {
-      const fullPath = path.join(this.repoPath, relativePath);
-      const content = await fs.readFile(fullPath, 'utf-8');
-      this.set(relativePath, content);
-      return content;
-    } catch {
-      this.set(relativePath, '');
-      return '';
+
+    // Try each root until file is found (for multi-root indexing)
+    for (const root of this.roots) {
+      try {
+        const fullPath = path.join(root, relativePath);
+        const content = await fs.readFile(fullPath, 'utf-8');
+        this.set(relativePath, content);
+        return content;
+      } catch {
+        // Try next root
+        continue;
+      }
     }
+
+    // File not found in any root
+    this.set(relativePath, '');
+    return '';
   }
 
   private set(key: string, value: string) {
@@ -208,10 +218,13 @@ export interface StreamedCSVResult {
  * Stream all CSV data directly to disk files.
  * Iterates graph nodes exactly ONCE — routes each node to the right writer.
  * File contents are lazy-read from disk with a generous LRU cache.
+ *
+ * Multi-root support: repoPath can be a string or array. When multiple roots
+ * are provided, FileContentCache tries each root until the file is found.
  */
 export const streamAllCSVsToDisk = async (
   graph: KnowledgeGraph,
-  repoPath: string,
+  repoPath: string | string[],
   csvDir: string,
 ): Promise<StreamedCSVResult> => {
   // Remove stale CSVs from previous crashed runs, then recreate

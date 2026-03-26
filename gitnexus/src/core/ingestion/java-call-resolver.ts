@@ -35,6 +35,13 @@ interface EdgeIndex {
 const edgeIndexCache = new WeakMap<KnowledgeGraph, EdgeIndex>();
 
 /**
+ * Track whether edge index has been refreshed for EXTENDS edges for each graph.
+ * EXTENDS edges are added by heritage-processor after initial index build,
+ * so we need to refresh the cache once when super-call resolution starts.
+ */
+const edgeIndexRefreshed = new WeakSet<KnowledgeGraph>();
+
+/**
  * Build or retrieve cached edge index for a graph.
  * Cost: O(E) once per graph, then O(1) lookups.
  */
@@ -45,7 +52,12 @@ function getEdgeIndex(graph: KnowledgeGraph): EdgeIndex {
   const start = performance.now();
   const bySource = new Map<string, Array<{ type: string; targetId: string }>>();
 
+  let totalEdges = 0;
+  let extendsEdges = 0;
   for (const rel of graph.iterRelationships()) {
+    totalEdges++;
+    if (rel.type === 'EXTENDS') extendsEdges++;
+
     if (!bySource.has(rel.sourceId)) {
       bySource.set(rel.sourceId, []);
     }
@@ -57,7 +69,7 @@ function getEdgeIndex(graph: KnowledgeGraph): EdgeIndex {
 
   const elapsed = performance.now() - start;
   if (process.env.GITNEXUS_DEBUG_JAVA) {
-    console.log(`[Java Performance] Edge index built: ${bySource.size} nodes indexed in ${elapsed.toFixed(0)}ms`);
+    console.log(`[Java Performance] Edge index built: ${bySource.size} nodes indexed, ${totalEdges} total edges (${extendsEdges} EXTENDS) in ${elapsed.toFixed(0)}ms`);
   }
 
   return index;
@@ -192,6 +204,7 @@ export interface JavaResolveResult {
 export interface JavaCallSite {
   calledName: string;
   objectName: string | null; // Receiver object (e.g., 'obj' in 'obj.method()')
+  objectTypeName?: string; // Pre-extracted type name (e.g., 'UserService' for obj: UserService)
   currentFile: string;
   enclosingFunctionId: string | null;
   callNode?: Parser.SyntaxNode;
@@ -217,75 +230,120 @@ export const resolveJavaCallTarget = (
   importMap: ImportMap,
   astCache: ASTCache,
 ): JavaResolveResult | null => {
-  const { calledName, objectName, currentFile, enclosingFunctionId } = call;
+  const { calledName, objectName, objectTypeName, currentFile, enclosingFunctionId } = call;
 
   if (perfStats) {
     perfStats.totalCalls++;
   }
 
   // Debug logging
-  if (process.env.GITNEXUS_DEBUG_JAVA) {
-    console.log(`[Java Resolver] Processing call: ${objectName ? objectName + '.' : ''}${calledName} in ${currentFile}`);
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
+  if (debug) {
+    console.log(`\n[Java Resolver] ${objectName ? objectName + '.' : ''}${calledName} in ${currentFile.split('/').pop()}`);
+    console.log(`  enclosingFunctionId: ${enclosingFunctionId || 'null'}`);
+    console.log(`  astCache available: ${!!astCache}`);
+    console.log(`  objectTypeName (pre-extracted): ${objectTypeName || 'null'}`);
   }
 
-  // 1. methodInstance: obj.method() - obj is a local variable/parameter
-  // Requires AST parsing - skip if AST not available
-  if (objectName && astCache) {
-    const start = performance.now();
-    const result = resolveMethodInstance(calledName, objectName, currentFile, enclosingFunctionId, graph, symbolTable, astCache);
-    const elapsed = performance.now() - start;
+  // Optimized resolution order:
+  // 1. static - if objectName is capitalized (e.g., Utils.format())
+  // 2. methodInstance (fast path) - if has pre-extracted type and not capitalized
+  // 3. classInstance - fallback when fast path fails (class field lookup)
+  // 4. methodInstance (slow path) - AST fallback when no pre-extracted type
+  //
+  // Performance optimization: Use fast path first (zero cost) before expensive
+  // classInstance lookup (findEnclosingClass + findFieldInClass + inheritance chain).
+  // This avoids 100k+ unnecessary field lookups.
 
-    if (perfStats) {
-      perfStats.typeBreakdown.methodInstance.time += elapsed;
-    }
-
-    if (result) {
-      if (perfStats) {
-        perfStats.typeBreakdown.methodInstance.count++;
-        perfStats.resolvedCalls++;
-      }
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as methodInstance (${elapsed.toFixed(2)}ms)`);
-      return result;
-    }
-  }
-
-  // 2. classInstance: obj.method() - obj is a class field
   if (objectName) {
-    const start = performance.now();
-    const result = resolveClassInstance(calledName, objectName, currentFile, enclosingFunctionId, graph, symbolTable);
-    const elapsed = performance.now() - start;
+    // 1. static: ClassName.method() or full.path.ClassName.method()
+    if (isCapitalized(objectName)) {
+      const start = performance.now();
+      const result = resolveStaticCall(calledName, objectName, currentFile, graph, symbolTable, importMap);
+      const elapsed = performance.now() - start;
 
-    if (perfStats) {
-      perfStats.typeBreakdown.classInstance.time += elapsed;
+      if (perfStats) {
+        perfStats.typeBreakdown.static.time += elapsed;
+      }
+
+      if (result) {
+        if (perfStats) {
+          perfStats.typeBreakdown.static.count++;
+          perfStats.resolvedCalls++;
+        }
+        if (debug) console.log(`  ✓ Resolved as static (${elapsed.toFixed(2)}ms)`);
+        return result;
+      } else if (debug) {
+        console.log(`  ✗ static failed (${elapsed.toFixed(2)}ms)`);
+      }
     }
 
-    if (result) {
+    // 2. methodInstance (fast path): use pre-extracted type if available (zero AST cost)
+    // Skip if capitalized (handled by static above)
+    if (!isCapitalized(objectName) && objectTypeName) {
+      const start = performance.now();
+      const result = resolveMethodInstanceByType(calledName, objectTypeName, currentFile, symbolTable, importMap);
+      const elapsed = performance.now() - start;
+
+      if (perfStats) {
+        perfStats.typeBreakdown.methodInstance.time += elapsed;
+      }
+
+      if (result) {
+        if (perfStats) {
+          perfStats.typeBreakdown.methodInstance.count++;
+          perfStats.resolvedCalls++;
+        }
+        if (debug) console.log(`  ✓ Resolved as methodInstance (pre-extracted type, ${elapsed.toFixed(2)}ms)`);
+        return result;
+      } else if (debug) {
+        console.log(`  ✗ methodInstance fast path failed (pre-extracted type, ${elapsed.toFixed(2)}ms)`);
+      }
+    }
+
+    // 3. classInstance: obj.method() - obj is a class field
+    // Only checked when fast path fails (field might not have type annotation)
+    const start2 = performance.now();
+    const classInstanceResult = resolveClassInstance(calledName, objectName, currentFile, enclosingFunctionId, graph, symbolTable, importMap);
+    const elapsed2 = performance.now() - start2;
+
+    if (perfStats) {
+      perfStats.typeBreakdown.classInstance.time += elapsed2;
+    }
+
+    if (classInstanceResult) {
       if (perfStats) {
         perfStats.typeBreakdown.classInstance.count++;
         perfStats.resolvedCalls++;
       }
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as classInstance (${elapsed.toFixed(2)}ms)`);
-      return result;
-    }
-  }
-
-  // 3. static: ClassName.method() or full.path.ClassName.method()
-  if (objectName && isCapitalized(objectName)) {
-    const start = performance.now();
-    const result = resolveStaticCall(calledName, objectName, currentFile, graph, symbolTable, importMap);
-    const elapsed = performance.now() - start;
-
-    if (perfStats) {
-      perfStats.typeBreakdown.static.time += elapsed;
+      if (debug) console.log(`  ✓ Resolved as classInstance (${elapsed2.toFixed(2)}ms)`);
+      return classInstanceResult;
+    } else if (debug) {
+      console.log(`  ✗ classInstance failed (${elapsed2.toFixed(2)}ms)`);
     }
 
-    if (result) {
+    // 4. methodInstance (slow path): parse AST if available (fallback)
+    if (astCache) {
+      const start = performance.now();
+      const result = resolveMethodInstance(calledName, objectName, currentFile, enclosingFunctionId, graph, symbolTable, importMap, astCache);
+      const elapsed = performance.now() - start;
+
       if (perfStats) {
-        perfStats.typeBreakdown.static.count++;
-        perfStats.resolvedCalls++;
+        perfStats.typeBreakdown.methodInstance.time += elapsed;
       }
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as static (${elapsed.toFixed(2)}ms)`);
-      return result;
+
+      if (result) {
+        if (perfStats) {
+          perfStats.typeBreakdown.methodInstance.count++;
+          perfStats.resolvedCalls++;
+        }
+        if (debug) console.log(`  ✓ Resolved as methodInstance (AST parse, ${elapsed.toFixed(2)}ms)`);
+        return result;
+      } else if (debug) {
+        console.log(`  ✗ methodInstance slow path failed (AST parse, ${elapsed.toFixed(2)}ms)`);
+      }
+    } else if (!objectTypeName && !astCache && debug) {
+      console.log(`  ⊘ methodInstance skipped (no pre-extracted type, no AST cache)`);
     }
   }
 
@@ -304,15 +362,17 @@ export const resolveJavaCallTarget = (
         perfStats.typeBreakdown.this.count++;
         perfStats.resolvedCalls++;
       }
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as this (${elapsed.toFixed(2)}ms)`);
+      if (debug) console.log(`  ✓ Resolved as this (${elapsed.toFixed(2)}ms)`);
       return result;
+    } else if (debug) {
+      console.log(`  ✗ this failed (${elapsed.toFixed(2)}ms)`);
     }
   }
 
   // 5. super: method() - parent class method
   if (!objectName) {
     const start = performance.now();
-    const result = resolveSuperCall(calledName, currentFile, enclosingFunctionId, graph, symbolTable);
+    const result = resolveSuperCall(calledName, currentFile, enclosingFunctionId, graph, symbolTable, importMap);
     const elapsed = performance.now() - start;
 
     if (perfStats) {
@@ -324,8 +384,10 @@ export const resolveJavaCallTarget = (
         perfStats.typeBreakdown.super.count++;
         perfStats.resolvedCalls++;
       }
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as super (${elapsed.toFixed(2)}ms)`);
+      if (debug) console.log(`  ✓ Resolved as super (${elapsed.toFixed(2)}ms)`);
       return result;
+    } else if (debug) {
+      console.log(`  ✗ super failed (${elapsed.toFixed(2)}ms)`);
     }
   }
 
@@ -344,8 +406,10 @@ export const resolveJavaCallTarget = (
         perfStats.typeBreakdown.interface.count++;
         perfStats.resolvedCalls++;
       }
-      if (process.env.GITNEXUS_DEBUG_JAVA) console.log(`  ✓ Resolved as interface (${elapsed.toFixed(2)}ms)`);
+      if (debug) console.log(`  ✓ Resolved as interface (${elapsed.toFixed(2)}ms)`);
       return result;
+    } else if (debug) {
+      console.log(`  ✗ interface failed (${elapsed.toFixed(2)}ms)`);
     }
   }
 
@@ -353,8 +417,8 @@ export const resolveJavaCallTarget = (
   if (perfStats) {
     perfStats.unresolvedCalls++;
   }
-  if (process.env.GITNEXUS_DEBUG_JAVA) {
-    console.log(`  ✗ Unable to resolve`);
+  if (debug) {
+    console.log(`  ✗ ALL TYPES FAILED`);
   }
   return null;
 };
@@ -362,7 +426,59 @@ export const resolveJavaCallTarget = (
 // ── Resolution Strategies ───────────────────────────────────────────
 
 /**
- * 1. methodInstance: Resolve calls to methods on local variables/parameters.
+ * 1a. methodInstance (fast path): Resolve using pre-extracted type from worker.
+ * Zero AST parsing cost - worker already extracted the type during initial parse.
+ *
+ * Example: UserService service = ...; service.validateUser();
+ * Worker extracts: objectName='service', objectTypeName='UserService'
+ * This function: lookup 'UserService' class, find 'validateUser' method
+ */
+const resolveMethodInstanceByType = (
+  calledName: string,
+  typeName: string,
+  currentFile: string,
+  symbolTable: SymbolTable,
+  importMap: ImportMap,
+): JavaResolveResult | null => {
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
+
+  if (debug) console.log(`    [methodInstance-fast] Type: ${typeName}`);
+
+  // Find class by type name
+  const classDef = trackTime('findClassByTypeName', () =>
+    findClassByTypeName(typeName, currentFile, symbolTable, importMap)
+  );
+
+  if (!classDef) {
+    if (debug) console.log(`    [methodInstance-fast] FAIL: Class '${typeName}' not found`);
+    return null;
+  }
+
+  if (debug) console.log(`    [methodInstance-fast] Found class: ${classDef.nodeId}`);
+
+  // Find method in class
+  const methodDef = trackTime('findMethodInClass', () =>
+    symbolTable.findMethodInClass(classDef.nodeId, calledName)
+  );
+
+  if (!methodDef) {
+    if (debug) console.log(`    [methodInstance-fast] FAIL: Method '${calledName}' not found in class`);
+    return null;
+  }
+
+  if (debug) console.log(`    [methodInstance-fast] SUCCESS: Found method ${methodDef.nodeId}`);
+
+  return {
+    nodeId: methodDef.nodeId,
+    confidence: 0.95,
+    reason: 'methodInstance',
+    filePath: methodDef.filePath,
+    returnType: methodDef.returnType,
+  };
+};
+
+/**
+ * 1b. methodInstance (slow path): Resolve by parsing AST to extract local variables.
  * Example: UserService service = new UserService(); service.validateUser();
  *
  * Resolution strategy:
@@ -379,34 +495,65 @@ const resolveMethodInstance = (
   enclosingFunctionId: string | null,
   graph: KnowledgeGraph,
   symbolTable: SymbolTable,
+  importMap: ImportMap,
   astCache: ASTCache,
 ): JavaResolveResult | null => {
-  if (!enclosingFunctionId) return null;
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
+
+  if (!enclosingFunctionId) {
+    if (debug) console.log(`    [methodInstance] FAIL: No enclosing function ID`);
+    return null;
+  }
 
   // Get method AST from cache
   const tree = astCache.get(currentFile);
-  if (!tree) return null;
+  if (!tree) {
+    if (debug) console.log(`    [methodInstance] FAIL: No AST tree for file`);
+    return null;
+  }
 
   // Extract local variables from method body
   const locals = trackTime('extractLocalVariables', () =>
     extractLocalVariables(tree.rootNode, enclosingFunctionId, currentFile)
   );
 
+  if (debug) {
+    console.log(`    [methodInstance] Extracted ${locals.length} local variables/parameters:`);
+    locals.forEach(v => console.log(`      - ${v.name}: ${v.typeName}`));
+  }
+
   // Find variable matching objectName
   const variable = locals.find(v => v.name === objectName);
-  if (!variable) return null;
+  if (!variable) {
+    if (debug) console.log(`    [methodInstance] FAIL: Variable '${objectName}' not found in locals`);
+    return null;
+  }
+
+  if (debug) console.log(`    [methodInstance] Found variable: ${variable.name}: ${variable.typeName}`);
 
   // Find class by type name
   const classDef = trackTime('findClassByTypeName', () =>
-    findClassByTypeName(variable.typeName, currentFile, symbolTable)
+    findClassByTypeName(variable.typeName, currentFile, symbolTable, importMap)
   );
-  if (!classDef) return null;
+
+  if (!classDef) {
+    if (debug) console.log(`    [methodInstance] FAIL: Class '${variable.typeName}' not found`);
+    return null;
+  }
+
+  if (debug) console.log(`    [methodInstance] Found class: ${classDef.nodeId}`);
 
   // Find method in class
   const methodDef = trackTime('findMethodInClass', () =>
     symbolTable.findMethodInClass(classDef.nodeId, calledName)
   );
-  if (!methodDef) return null;
+
+  if (!methodDef) {
+    if (debug) console.log(`    [methodInstance] FAIL: Method '${calledName}' not found in class`);
+    return null;
+  }
+
+  if (debug) console.log(`    [methodInstance] SUCCESS: Found method ${methodDef.nodeId}`);
 
   return {
     nodeId: methodDef.nodeId,
@@ -435,29 +582,50 @@ const extractLocalVariables = (
   enclosingFunctionId: string,
   currentFile: string,
 ): LocalVariable[] => {
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
   const locals: LocalVariable[] = [];
 
-  // Extract method name from enclosingFunctionId (format: "Method:filePath:className:methodName")
+  // Extract method name from enclosingFunctionId
+  // Format can be either:
+  // - "Method:filePath:methodName" (2 colons)
+  // - "Method:filePath:className:methodName" (3 colons)
   const parts = enclosingFunctionId.split(':');
-  const methodName = parts.length >= 4 ? parts[3] : null;
-  if (!methodName) return locals;
+  const methodName = parts.length >= 3 ? parts[parts.length - 1] : null;
+
+  if (!methodName) {
+    if (debug) console.log(`      [extractLocalVariables] FAIL: Cannot extract method name from ${enclosingFunctionId}`);
+    return locals;
+  }
+
+  if (debug) console.log(`      [extractLocalVariables] Looking for method: ${methodName} (from ID: ${enclosingFunctionId})`);
 
   // Find the method declaration node
   const methodNode = findMethodNode(rootNode, methodName);
-  if (!methodNode) return locals;
+  if (!methodNode) {
+    if (debug) console.log(`      [extractLocalVariables] FAIL: Method node not found in AST`);
+    return locals;
+  }
+
+  if (debug) console.log(`      [extractLocalVariables] Found method node type: ${methodNode.type}`);
 
   // Walk AST to find local variable declarations and parameters
   const walkNode = (node: Parser.SyntaxNode) => {
     // Extract local variable declarations
     if (node.type === 'local_variable_declaration') {
       const varDecl = parseLocalVariableDeclaration(node);
-      if (varDecl) locals.push(varDecl);
+      if (varDecl) {
+        locals.push(varDecl);
+        if (debug) console.log(`      [extractLocalVariables] Found local var: ${varDecl.name}: ${varDecl.typeName}`);
+      }
     }
 
     // Extract formal parameters
     if (node.type === 'formal_parameter') {
       const param = parseFormalParameter(node);
-      if (param) locals.push(param);
+      if (param) {
+        locals.push(param);
+        if (debug) console.log(`      [extractLocalVariables] Found parameter: ${param.name}: ${param.typeName}`);
+      }
     }
 
     // Recurse into children
@@ -467,6 +635,8 @@ const extractLocalVariables = (
   };
 
   walkNode(methodNode);
+
+  if (debug) console.log(`      [extractLocalVariables] Total found: ${locals.length}`);
   return locals;
 };
 
@@ -552,12 +722,13 @@ const extractTypeName = (typeNode: Parser.SyntaxNode): string | null => {
 
 /**
  * Find a class definition by type name.
- * Searches in current file first, then in imported files.
+ * Searches in current file first, then in imported files, then globally.
  */
 const findClassByTypeName = (
   typeName: string,
   currentFile: string,
   symbolTable: SymbolTable,
+  importMap?: ImportMap,
 ): SymbolDefinition | null => {
   // Try same-file lookup first
   const localDef = symbolTable.lookupExactFull(currentFile, typeName);
@@ -569,8 +740,22 @@ const findClassByTypeName = (
   const allDefs = symbolTable.lookupFuzzy(typeName);
   const classDefs = allDefs.filter(def => def.type === 'Class' || def.type === 'Interface' || def.type === 'Enum');
 
-  // Return first match (could be improved with import resolution)
-  return classDefs.length > 0 ? classDefs[0] : null;
+  if (classDefs.length === 0) return null;
+
+  // If only one match, return it
+  if (classDefs.length === 1) return classDefs[0];
+
+  // Multiple matches - use import resolution to disambiguate
+  if (importMap) {
+    const importedFiles = importMap.get(currentFile);
+    if (importedFiles) {
+      const importedDef = classDefs.find(def => importedFiles.has(def.filePath));
+      if (importedDef) return importedDef;
+    }
+  }
+
+  // Fallback: return first match (ambiguous, but better than null)
+  return classDefs[0];
 };
 
 /**
@@ -592,34 +777,71 @@ const resolveClassInstance = (
   enclosingFunctionId: string | null,
   graph: KnowledgeGraph,
   symbolTable: SymbolTable,
+  importMap: ImportMap,
 ): JavaResolveResult | null => {
-  // Find the enclosing class
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
+
+  // Find the enclosingclass
   const enclosingClass = trackTime('findEnclosingClass', () =>
     findEnclosingClass(enclosingFunctionId, currentFile, graph)
   );
-  if (!enclosingClass) return null;
+
+  if (!enclosingClass) {
+    if (debug) console.log(`    [classInstance] FAIL: No enclosing class found`);
+    return null;
+  }
+
+  if (debug) console.log(`    [classInstance] Enclosing class: ${enclosingClass.id}`);
 
   // Find field in class (supports inheritance)
   const fieldDef = trackTime('findFieldInClass', () =>
     findFieldInClass(enclosingClass.id, objectName, graph, symbolTable)
   );
-  if (!fieldDef || !fieldDef.declaredType) return null;
+
+  if (!fieldDef) {
+    if (debug) console.log(`    [classInstance] FAIL: Field '${objectName}' not found in class or parents`);
+    return null;
+  }
+
+  if (debug) console.log(`    [classInstance] Found field: ${fieldDef.nodeId}, type: ${fieldDef.declaredType}`);
+
+  if (!fieldDef.declaredType) {
+    if (debug) console.log(`    [classInstance] FAIL: Field has no declaredType`);
+    return null;
+  }
 
   // Extract type name from declared type (strip generics if present)
   const typeName = extractTypeNameFromString(fieldDef.declaredType);
-  if (!typeName) return null;
+  if (!typeName) {
+    if (debug) console.log(`    [classInstance] FAIL: Cannot extract type name from '${fieldDef.declaredType}'`);
+    return null;
+  }
+
+  if (debug) console.log(`    [classInstance] Extracted type name: ${typeName}`);
 
   // Find class by type name
   const classDef = trackTime('findClassByTypeName', () =>
-    findClassByTypeName(typeName, currentFile, symbolTable)
+    findClassByTypeName(typeName, currentFile, symbolTable, importMap)
   );
-  if (!classDef) return null;
+
+  if (!classDef) {
+    if (debug) console.log(`    [classInstance] FAIL: Class '${typeName}' not found`);
+    return null;
+  }
+
+  if (debug) console.log(`    [classInstance] Found class: ${classDef.nodeId}`);
 
   // Find method in class
   const methodDef = trackTime('findMethodInClass', () =>
     symbolTable.findMethodInClass(classDef.nodeId, calledName)
   );
-  if (!methodDef) return null;
+
+  if (!methodDef) {
+    if (debug) console.log(`    [classInstance] FAIL: Method '${calledName}' not found in class ${classDef.nodeId}`);
+    return null;
+  }
+
+  if (debug) console.log(`    [classInstance] SUCCESS: Found method ${methodDef.nodeId}`);
 
   return {
     nodeId: methodDef.nodeId,
@@ -711,35 +933,77 @@ const resolveStaticCall = (
   symbolTable: SymbolTable,
   importMap: ImportMap,
 ): JavaResolveResult | null => {
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
   let classCandidates: SymbolDefinition[] = [];
 
   // Case A: Simple class name (e.g., "Utils")
   if (!objectName.includes('.')) {
     // Check if class is imported
     const importedFiles = importMap.get(currentFile);
+    if (debug) {
+      console.log(`    [static] Simple class name: ${objectName}`);
+      console.log(`    [static] Imported files count: ${importedFiles?.size || 0}`);
+    }
+
     if (importedFiles) {
       // Lookup class in imported files
       const allClasses = symbolTable.lookupFuzzy(objectName);
+      if (debug) console.log(`    [static] lookupFuzzy('${objectName}') found ${allClasses.length} candidates`);
+
       classCandidates = allClasses.filter(def =>
         (def.type === 'Class' || def.type === 'Interface' || def.type === 'Enum') &&
         importedFiles.has(def.filePath)
       );
+
+      if (debug) console.log(`    [static] After import filter: ${classCandidates.length} candidates`);
+    } else if (debug) {
+      console.log(`    [static] No imports found for file`);
+    }
+
+    // Fallback: check same-package classes (no import required in Java)
+    if (classCandidates.length === 0) {
+      if (debug) console.log(`    [static] Trying same-package fallback...`);
+      const allClasses = symbolTable.lookupFuzzy(objectName);
+      if (debug) console.log(`    [static] lookupFuzzy('${objectName}') found ${allClasses.length} total candidates`);
+
+      // Find classes in the same directory (same package)
+      const currentDir = currentFile.substring(0, currentFile.lastIndexOf('/'));
+      if (debug) console.log(`    [static] Current dir: ${currentDir}`);
+
+      classCandidates = allClasses.filter(def => {
+        if (def.type !== 'Class' && def.type !== 'Interface' && def.type !== 'Enum') return false;
+        const defDir = def.filePath.substring(0, def.filePath.lastIndexOf('/'));
+        const isSamePackage = defDir === currentDir;
+        if (debug && isSamePackage) console.log(`    [static] Same-package match: ${def.filePath}`);
+        return isSamePackage;
+      });
+
+      if (debug) console.log(`    [static] After same-package filter: ${classCandidates.length} candidates`);
     }
   }
   // Case B: Fully qualified name (e.g., "com.example.Utils")
   else {
+    if (debug) console.log(`    [static] Fully qualified name: ${objectName}`);
     classCandidates = symbolTable.findSymbolsByQualifiedName(objectName);
+    if (debug) console.log(`    [static] findSymbolsByQualifiedName found ${classCandidates.length} candidates`);
   }
 
   // No class found
-  if (classCandidates.length === 0) return null;
+  if (classCandidates.length === 0) {
+    if (debug) console.log(`    [static] FAIL: No class candidates`);
+    return null;
+  }
 
   // Try to find the method in each candidate class
   for (const classDef of classCandidates) {
+    if (debug) console.log(`    [static] Trying class: ${classDef.nodeId}`);
+
     const methodDef = trackTime('findMethodInClass', () =>
       symbolTable.findMethodInClass(classDef.nodeId, calledName)
     );
+
     if (methodDef) {
+      if (debug) console.log(`    [static] SUCCESS: Found method ${calledName} in ${classDef.nodeId}`);
       return {
         nodeId: methodDef.nodeId,
         confidence: 0.95,
@@ -747,9 +1011,12 @@ const resolveStaticCall = (
         filePath: methodDef.filePath,
         returnType: methodDef.returnType,
       };
+    } else if (debug) {
+      console.log(`    [static] Method ${calledName} not found in ${classDef.nodeId}`);
     }
   }
 
+  if (debug) console.log(`    [static] FAIL: Method not found in any candidate class`);
   return null;
 };
 
@@ -768,17 +1035,31 @@ const resolveThisCall = (
   graph: KnowledgeGraph,
   symbolTable: SymbolTable,
 ): JavaResolveResult | null => {
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
+
   // Find the enclosing class
   const enclosingClass = trackTime('findEnclosingClass', () =>
     findEnclosingClass(enclosingFunctionId, currentFile, graph)
   );
-  if (!enclosingClass) return null;
+
+  if (!enclosingClass) {
+    if (debug) console.log(`    [this] FAIL: No enclosing class found`);
+    return null;
+  }
+
+  if (debug) console.log(`    [this] Enclosing class: ${enclosingClass.id}`);
 
   // Find method in current class
   const methodDef = trackTime('findMethodInClass', () =>
     symbolTable.findMethodInClass(enclosingClass.id, calledName)
   );
-  if (!methodDef) return null;
+
+  if (!methodDef) {
+    if (debug) console.log(`    [this] FAIL: Method '${calledName}' not found in class`);
+    return null;
+  }
+
+  if (debug) console.log(`    [this] SUCCESS: Found method ${methodDef.nodeId}`);
 
   return {
     nodeId: methodDef.nodeId,
@@ -805,20 +1086,37 @@ const resolveSuperCall = (
   enclosingFunctionId: string | null,
   graph: KnowledgeGraph,
   symbolTable: SymbolTable,
+  importMap: ImportMap,
 ): JavaResolveResult | null => {
+  const debug = process.env.GITNEXUS_DEBUG_JAVA;
+
   // Find the enclosing class
   const enclosingClass = trackTime('findEnclosingClass', () =>
     findEnclosingClass(enclosingFunctionId, currentFile, graph)
   );
-  if (!enclosingClass) return null;
 
-  // Traverse parent class chain
+  if (!enclosingClass) {
+    if (debug) console.log(`    [super] FAIL: No enclosingclass found`);
+    return null;
+  }
+
+  if (debug) console.log(`    [super] Enclosing class: ${enclosingClass.id}`);
+
+  // Traverse parent class chain using EXTENDS edges
   return trackTime('traverseInheritance', () => {
-    // Get edge index for O(1) relationship lookup
+    // Refresh edge index once per graph to ensure EXTENDS edges are included
+    // (Heritage processor adds EXTENDS edges after initial index build, but we only
+    // need to refresh once, not on every super-call - massive performance improvement)
+    if (!edgeIndexRefreshed.has(graph)) {
+      edgeIndexCache.delete(graph);
+      edgeIndexRefreshed.add(graph);
+    }
     const edgeIndex = getEdgeIndex(graph);
 
     const visited = new Set<string>();
     const queue: string[] = [enclosingClass.id];
+
+    if (debug) console.log(`    [super] Starting inheritance traversal from ${enclosingClass.id}`);
 
     while (queue.length > 0) {
       const currentClassId = queue.shift()!;
@@ -827,32 +1125,86 @@ const resolveSuperCall = (
       if (visited.has(currentClassId)) continue;
       visited.add(currentClassId);
 
+      if (debug) console.log(`    [super] Checking class: ${currentClassId}`);
+
       // Find EXTENDS edges using index (O(1) vs O(E))
       const edges = edgeIndex.bySource.get(currentClassId) || [];
       const extendsEdges = edges.filter(e => e.type === 'EXTENDS');
 
-      for (const edge of extendsEdges) {
-        const parentClassId = edge.targetId;
+      if (debug) console.log(`    [super] Found ${extendsEdges.length} EXTENDS edges from index`);
 
-        // Try to find method in parent class
-        const methodDef = trackTime('findMethodInClass', () =>
-          symbolTable.findMethodInClass(parentClassId, calledName)
-        );
-        if (methodDef) {
-          return {
-            nodeId: methodDef.nodeId,
-            confidence: 0.85,
-            reason: 'super' as const,
-            filePath: methodDef.filePath,
-            returnType: methodDef.returnType,
-          };
+      // Fallback: If no EXTENDS edges found in index, extract from node properties
+      // (This happens when heritage-processor hasn't run yet during parallel indexing)
+      if (extendsEdges.length === 0) {
+        const currentNode = graph.getNode(currentClassId);
+        const parentClassName = (currentNode?.properties as any)?.superClassName as string | undefined;
+
+        if (parentClassName && debug) {
+          console.log(`    [super] Fallback: Found parent class name '${parentClassName}' from node properties`);
         }
 
-        // Continue searching in grandparent classes
-        queue.push(parentClassId);
+        if (parentClassName) {
+          // Find parent class by name
+          const parentClass = findClassByTypeName(parentClassName, currentFile, symbolTable, importMap);
+
+          if (parentClass && debug) {
+            console.log(`    [super] Fallback: Resolved parent class to ${parentClass.nodeId}`);
+          }
+
+          if (parentClass) {
+            // Try to find method in parent class
+            const methodDef = trackTime('findMethodInClass', () =>
+              symbolTable.findMethodInClass(parentClass.nodeId, calledName)
+            );
+
+            if (methodDef) {
+              if (debug) console.log(`    [super] SUCCESS: Found method ${methodDef.nodeId} via fallback`);
+              return {
+                nodeId: methodDef.nodeId,
+                confidence: 0.85,
+                reason: 'super' as const,
+                filePath: methodDef.filePath,
+                returnType: methodDef.returnType,
+              };
+            } else if (debug) {
+              console.log(`    [super] Method '${calledName}' not found in ${parentClass.nodeId}`);
+            }
+
+            // Continue searching in grandparent classes
+            queue.push(parentClass.nodeId);
+          }
+        }
+      } else {
+        // Use EXTENDS edges from index (normal path)
+        for (const edge of extendsEdges) {
+          const parentClassId = edge.targetId;
+
+          if (debug) console.log(`    [super] Checking parent: ${parentClassId}`);
+
+          // Try to find method in parent class
+          const methodDef = trackTime('findMethodInClass', () =>
+            symbolTable.findMethodInClass(parentClassId, calledName)
+          );
+          if (methodDef) {
+            if (debug) console.log(`    [super] SUCCESS: Found method ${methodDef.nodeId}`);
+            return {
+              nodeId: methodDef.nodeId,
+              confidence: 0.85,
+              reason: 'super' as const,
+              filePath: methodDef.filePath,
+              returnType: methodDef.returnType,
+            };
+          } else if (debug) {
+            console.log(`    [super] Method '${calledName}' not found in ${parentClassId}`);
+          }
+
+          // Continue searching in grandparent classes
+          queue.push(parentClassId);
+        }
       }
     }
 
+    if (debug) console.log(`    [super] FAIL: No method found in inheritance chain`);
     return null;
   });
 };

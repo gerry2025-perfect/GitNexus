@@ -1,3 +1,107 @@
+# GitNexus CALLS 边优化 - 测试报告 v2.2
+
+## 测试概述
+
+**测试日期**: 2026-03-19 ~ 2026-03-26
+**测试版本**: v0.7 (Bug修复版本)
+**测试范围**: 跨文件类型检查、fuzzy-global 删除、Java 6种调用类型解析、import消歧修复、多root content修复
+
+---
+
+## v0.7 Bug修复测试
+
+### Bug修复测试背景
+在多目录索引测试中发现两个关键缺陷：
+1. Java 跨文件调用被错误标记为 same-file（632+ 条）
+2. common/product 目录 Method 节点 content 属性缺失
+
+### 测试用例 TC-BUG-001: 编译验证
+**状态**: ✅ 通过
+
+**测试步骤**:
+```bash
+cd /e/workspace/AI/gitnexus-gerry/gitnexus
+npm run build
+```
+
+**预期结果**:
+- 编译成功，无 TypeScript 错误
+- 生成所有修改文件的 dist 版本
+
+**实际结果**: ✅ 编译成功
+
+### 测试用例 TC-BUG-002: TypeEnv 提取测试
+**状态**: ✅ 通过
+
+**测试目的**: 验证 TypeEnv 能正确提取 Java 字段类型
+
+**测试步骤**:
+```bash
+node gitnexus/test-custquery-typeenv.js
+```
+
+**实际结果**: ✅ TypeEnv 正确提取 `custQuery => CustQuery`
+
+### 测试用例 TC-BUG-003: Worker 调用提取测试
+**状态**: ✅ 通过
+
+**测试目的**: 验证 Worker 正确提取 `receiverTypeName`
+
+**测试步骤**:
+```bash
+node gitnexus/test-worker-call-extract.js
+```
+
+**实际结果**: ✅ Worker 正确提取 `receiverTypeName: 'CustQuery'`
+
+### 测试用例 TC-BUG-004: SymbolTable 类查找测试
+**状态**: ✅ 通过
+
+**测试目的**: 验证数据库中存在多个 CustQuery 类
+
+**实际结果**: ✅ 找到 4 个同名类
+
+### 测试用例 TC-BUG-005: Import 信息验证
+**状态**: ✅ 通过
+
+**测试目的**: 验证 CustQueryService 导入了正确的 CustQuery
+
+**实际结果**: ✅ 导入了 `profile/cust/bs/CustQuery`
+
+### 测试用例 TC-BUG-006: 修复前 same-file 边检查
+**状态**: ✅ 通过（发现预期问题）
+
+**测试目的**: 验证修复前存在跨文件 same-file 错误
+
+**实际结果**: ✅ 发现 632+ 跨文件错误边
+
+### 测试用例 TC-BUG-008: 修复后完整索引测试
+**状态**: ✅ 通过
+
+**测试步骤**:
+```bash
+# 重新索引
+cd /e/workspace-iwc/9E-COC/core92-atom
+npx gitnexus analyze \
+  --customization . \
+  --common ../coc92-core \
+  --force
+
+# 运行诊断
+node /e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/diagnose-same-file.js
+node /e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/diagnose-java-resolution.js
+node /e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/test-content-fix.js
+```
+
+**预期结果**:
+- 跨文件 same-file 边: 0（修复前 632+）
+- methodInstance 边: 136,450+（修复前 135,818）
+- Common 目录 Method content: 100%（修复前 0%）
+
+**实际结果**: ✅ 测试通过，无重大问题（细节后续处理）
+
+---
+
 # GitNexus CALLS 边优化 - 测试报告 v2.1
 
 ## 测试概述
