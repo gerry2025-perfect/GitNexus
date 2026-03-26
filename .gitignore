@@ -72,3 +72,8 @@ GitNexus.sln
 .worktrees/
 
 /github/scripts/triage/__pycache__/
+
+# Diagnostic scripts (local development only)
+gitnexus/gitnexus/
+gitnexus/test-*.js
+gitnexus/diagnose-*.js

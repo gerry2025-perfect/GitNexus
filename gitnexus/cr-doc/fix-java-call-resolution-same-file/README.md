@@ -93,14 +93,45 @@
    - 会话恢复脚本
    - 快速参考
 
-### 诊断脚本
-- `gitnexus/diagnose-same-file.js` - 诊断跨文件 same-file 边
-- `gitnexus/diagnose-java-resolution.js` - Java 解析分布统计
-- `gitnexus/test-content-fix.js` - Method content 验证
-- `gitnexus/test-custquery-typeenv.js` - TypeEnv 提取验证
-- `gitnexus/test-worker-call-extract.js` - Worker 调用提取验证
-- `gitnexus/test-class-existence.js` - SymbolTable 类查找验证
-- `gitnexus/test-cross-file-same-file.js` - 深度诊断跨文件边
+### 验证方法
+
+使用 MCP 工具查询验证：
+
+**检查 same-file 边**:
+```typescript
+gitnexus_cypher({
+  query: `
+    MATCH (a:Method)-[r:CodeRelation {type: 'CALLS'}]->(b:Method)
+    WHERE r.reason = 'same-file'
+      AND a.filePath <> b.filePath
+    RETURN count(*) as cross_file_same_file_edges
+  `
+})
+```
+
+**检查 Java 解析分布**:
+```typescript
+gitnexus_cypher({
+  query: `
+    MATCH ()-[r:CodeRelation {type: 'CALLS'}]->()
+    RETURN r.reason, count(*) as count, avg(r.confidence) as avg_confidence
+    ORDER BY count DESC
+  `
+})
+```
+
+**检查 Method content 完整性**:
+```typescript
+gitnexus_cypher({
+  query: `
+    MATCH (m:Method)
+    WHERE m.filePath CONTAINS 'coc92-core'
+    RETURN
+      count(*) as total,
+      count(CASE WHEN m.content IS NOT NULL AND m.content <> '' THEN 1 END) as with_content
+  `
+})
+```
 
 ---
 
@@ -122,7 +153,7 @@
    - 5 个函数签名更新
 
 ### 待测试文件 (0 个)
-无新增测试文件（使用现有诊断脚本）
+使用 MCP 工具验证（见上方验证方法）
 
 ---
 
@@ -144,16 +175,10 @@ npx gitnexus analyze \
 ```
 
 ### 3. 验证修复效果
-```bash
-# 检查 same-file 边
-node /e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/diagnose-same-file.js
-
-# 检查 Java 解析分布
-node /e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/diagnose-java-resolution.js
-
-# 检查 content 属性
-node /e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/test-content-fix.js
-```
+使用 MCP 工具查询（参见"验证方法"章节）：
+- 跨文件 same-file 边应为 0
+- methodInstance 边应增加 632+
+- Common 目录 Method content 应为 100%
 
 ### 4. 预期结果
 - ✅ 跨文件 same-file 边: 0（修复前 632+）
@@ -181,7 +206,7 @@ node /e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/test-content-fix.js
 
 ### 4. 可维护性
 - 代码改动集中，逻辑清晰
-- 诊断脚本完善，问题易定位
+- 可通过 MCP 工具验证，问题易定位
 - 文档详细，易于后续维护
 
 ---
@@ -253,14 +278,8 @@ npm run build
 cd /e/workspace-iwc/9E-COC/core92-atom
 npx gitnexus analyze --customization . --common ../coc92-core --force
 
-# 7. 运行诊断脚本
-cd /e/workspace/AI/gitnexus-gerry/gitnexus
-node gitnexus/diagnose-same-file.js
-node gitnexus/diagnose-java-resolution.js
-node gitnexus/test-content-fix.js
-
-# 8. 查看测试结果
-cat cr-doc/fix-java-call-resolution-same-file/fix-java-call-resolution-same-file-testcase.md
+# 7. 使用 MCP 工具验证（参见"验证方法"章节）
+# 或通过 Claude Code 执行 Cypher 查询
 ```
 
 ### 会话上下文关键信息
@@ -316,9 +335,9 @@ findClassByTypeName ✗ (返回错误类)
 ## 联系信息
 
 ### 技术支持
-- 文档路径: `/e/workspace/AI/gitnexus-gerry/gitnexus/cr-doc/fix-java-call-resolution-same-file/`
-- 诊断脚本: `/e/workspace/AI/gitnexus-gerry/gitnexus/gitnexus/diagnose-*.js`
-- Git 仓库: `/e/workspace/AI/gitnexus-gerry/gitnexus`
+- 文档路径: `E:\workspace\AI\gitnexus-gerry\gitnexus\cr-doc\fix-java-call-resolution-same-file\`
+- 验证方法: 使用 MCP 工具查询（见"验证方法"章节）
+- Git 仓库: `E:\workspace\AI\gitnexus-gerry\gitnexus`
 
 ### 相关资源
 - GitNexus 官方文档: https://docs.gitnexus.com

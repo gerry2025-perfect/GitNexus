@@ -693,11 +693,12 @@ npx gitnexus analyze \
   --common ../coc92-core \
   --force
 
-# 9. 运行诊断脚本
-cd /e/workspace/AI/gitnexus-gerry/gitnexus
-node gitnexus/diagnose-same-file.js
-node gitnexus/diagnose-java-resolution.js
-node gitnexus/test-content-fix.js
+# 9. 使用 MCP 工具验证
+# 通过 Claude Code 执行以下 Cypher 查询：
+# - 检查跨文件 same-file 边（应为 0）
+# - 检查 Java 解析分布
+# - 检查 Method content 完整性
+# 详见 gitnexus/cr-doc/fix-java-call-resolution-same-file/README.md "验证方法"章节
 ```
 
 **实现阶段**:
