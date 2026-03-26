@@ -583,11 +583,9 @@ const findEnclosingClass = (methodId, currentFile, graph) => {
 - ✅ Common 目录 Method content：0% → 100%
 
 **测试状态**：
-- ✅ 编译验证通过（npm run build 成功）
-- ✅ 基线测试通过（TC-001 到 TC-006）
-- ✅ 完整测试通过（TC-008）- 无重大问题，细节后续处理
-
-**相关文档**：详细文档见 `cr-doc/fix-java-call-resolution-same-file/`
+- ✅ 编译验证通过
+- ✅ 基线测试通过
+- ✅ 完整测试通过 - 无重大问题，细节后续处理
 
 ---
 
@@ -676,7 +674,6 @@ git show --name-only a4a4c13
 # 5. 阅读核心文档
 cat cr-doc/optimize-calls-edges-logic/README.md
 cat cr-doc/optimize-calls-edges-logic/optimize-calls-edges-logic-changelist.md
-cat gitnexus/cr-doc/fix-java-call-resolution-same-file/README.md
 
 # 6. 查看关键修改
 git diff a4a4c13^..a4a4c13 gitnexus/src/core/ingestion/java-call-resolver.ts | head -100
@@ -698,7 +695,6 @@ npx gitnexus analyze \
 # - 检查跨文件 same-file 边（应为 0）
 # - 检查 Java 解析分布
 # - 检查 Method content 完整性
-# 详见 gitnexus/cr-doc/fix-java-call-resolution-same-file/README.md "验证方法"章节
 ```
 
 **实现阶段**:
