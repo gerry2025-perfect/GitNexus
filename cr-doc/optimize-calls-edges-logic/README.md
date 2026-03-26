@@ -488,10 +488,11 @@ Java 解析器已实现但尚未集成到实际索引流程。
 
 ---
 
-**最后更新**：2026-03-20
-**文档版本**：v2.0（性能优化完成版）
-**项目状态**：✅ 全部完成（功能实现 + 性能优化 + 文档更新）
-**最终性能**：52秒（相比初始589秒提升91.2%）
+**最后更新**：2026-03-26
+**文档版本**：v2.1（v0.7 Bug修复完成版）
+**项目状态**：✅ 全部完成（功能实现 + 性能优化 + Bug修复 + 文档更新）
+**最终性能**：109秒（相比初始589秒提升81.5%）
+**最新版本**：v0.7（Java调用解析Bug修复）
 
 ---
 
@@ -648,5 +649,80 @@ ls -la gitnexus/src/core/ingestion/call-processor.ts
 - ✅ 编译测试通过（无错误、无警告）
 - ⏳ 功能测试（待测试数据）
 - ⏳ 性能测试（待测试数据）
+
+---
+
+### v0.7 Bug修复会话（2026-03-26）
+
+**背景**: 多目录索引测试发现 Java 调用解析和 content 属性缺失问题
+
+**会话ID**: 81eecc62-4fa2-463f-88bf-6b2f3e12d34d（后续由 5554d1b6-a4e6-4d37-8721-84d37dcbf855 继续）
+
+**恢复命令**:
+```bash
+# 1. 进入项目目录
+cd /e/workspace/AI/gitnexus-gerry
+
+# 2. 切换到特性分支
+git checkout feature/optimize-calls-edges-v0.5
+
+# 3. 查看最新提交
+git log --oneline -5
+# 应该看到: a4a4c13 feat(v0.7): 修复 Java 调用解析 same-file 错误
+
+# 4. 查看修改文件
+git show --name-only a4a4c13
+
+# 5. 阅读核心文档
+cat cr-doc/optimize-calls-edges-logic/README.md
+cat cr-doc/optimize-calls-edges-logic/optimize-calls-edges-logic-changelist.md
+cat gitnexus/cr-doc/fix-java-call-resolution-same-file/README.md
+
+# 6. 查看关键修改
+git diff a4a4c13^..a4a4c13 gitnexus/src/core/ingestion/java-call-resolver.ts | head -100
+git diff a4a4c13^..a4a4c13 gitnexus/src/core/lbug/csv-generator.ts | head -100
+
+# 7. 编译验证
+cd gitnexus
+npm run build
+
+# 8. 如需测试（多目录索引）
+cd /e/workspace-iwc/9E-COC/core92-atom
+npx gitnexus analyze \
+  --customization . \
+  --common ../coc92-core \
+  --force
+
+# 9. 运行诊断脚本
+cd /e/workspace/AI/gitnexus-gerry/gitnexus
+node gitnexus/diagnose-same-file.js
+node gitnexus/diagnose-java-resolution.js
+node gitnexus/test-content-fix.js
+```
+
+**实现阶段**:
+1. ✅ 分析问题根因（同名类消歧、多 root 文件读取）
+2. ✅ 设计修复方案（import 消歧 + 多 root 支持）
+3. ✅ 修改 findClassByTypeName 添加 importMap 参数
+4. ✅ 修改 FileContentCache 支持 string | string[]
+5. ✅ 更新调用链传递 importMap
+6. ✅ 编译测试通过
+7. ✅ 完整索引测试通过
+8. ✅ 更新文档并提交
+
+**完成时间**: 约1小时
+**代码行数**: ~100行修改（4个文件）
+
+**关键文件**:
+- `gitnexus/src/core/ingestion/java-call-resolver.ts` - import 消歧
+- `gitnexus/src/core/lbug/csv-generator.ts` - 多 root 支持
+- `gitnexus/src/core/lbug/lbug-adapter.ts` - 函数签名更新
+- `gitnexus/src/cli/analyze.ts` - 传入 roots 数组
+
+**测试结果**:
+- ✅ 编译测试通过
+- ✅ 基线测试通过（TC-001~TC-006）
+- ✅ 完整索引测试通过（TC-008）
+- ✅ 无重大问题，细节后续处理
 
 ---
