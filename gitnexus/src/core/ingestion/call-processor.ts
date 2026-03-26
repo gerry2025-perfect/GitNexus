@@ -288,11 +288,8 @@ export const processCalls = async (
   /** Phase 14 E3: cross-file RAW return types for for-loop element extraction. Keyed by filePath → Map<calleeName, rawReturnType>. */
   importedRawReturnTypesMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
 ): Promise<ExtractedHeritage[]> => {
-  // Initialize Java resolver performance tracking
-  if (process.env.GITNEXUS_DEBUG_JAVA) {
-    initJavaResolverStats();
-    console.log('[Java Performance] Performance tracking enabled');
-  }
+  // Initialize Java resolver performance tracking (always enabled for production monitoring)
+  initJavaResolverStats();
 
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
@@ -684,10 +681,8 @@ export const processCalls = async (
     }
   }
 
-  // Print Java resolver performance stats if tracking was enabled
-  if (process.env.GITNEXUS_DEBUG_JAVA) {
-    printJavaResolverStats();
-  }
+  // Print Java resolver performance stats (always show for production monitoring)
+  printJavaResolverStats();
 
   return collectedHeritage;
 };
@@ -1245,11 +1240,8 @@ export const processCallsFromExtracted = async (
   onProgress?: (current: number, total: number) => void,
   constructorBindings?: FileConstructorBindings[],
 ) => {
-  // Initialize Java resolver performance tracking
-  if (process.env.GITNEXUS_DEBUG_JAVA) {
-    initJavaResolverStats();
-    console.log('[Java Performance] Performance tracking enabled (worker mode)');
-  }
+  // Initialize Java resolver performance tracking (always enabled for production monitoring)
+  initJavaResolverStats();
 
   // Scope-aware receiver types: keyed by filePath → "funcName\0varName" → typeName.
   // The scope dimension prevents collisions when two functions in the same file
@@ -1334,38 +1326,40 @@ export const processCallsFromExtracted = async (
         }
       }
 
-      const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx);
+      // Java-specific resolution: Use specialized resolver for 6 precise call types
+      // Worker pre-extracted receiver types for zero-AST-cost resolution
+      let resolved: ResolveResult | null = null;
+      const lang = getLanguageFromFilename(effectiveCall.filePath);
+      if (lang === 'java') {
+        // Extract enclosingFunctionId from sourceId (format: "Method:filePath:className:methodName" or "File:filePath")
+        const enclosingFunctionId = effectiveCall.sourceId.startsWith('Method:') ? effectiveCall.sourceId : null;
 
-      // If generic resolver fails for Java files, try Java-specific resolver
-      // (worker mode doesn't have AST, so methodInstance won't work, but other types will)
-      let javaResolved: ResolveResult | null = null;
-      if (!resolved) {
-        const lang = getLanguageFromFilename(effectiveCall.filePath);
-        if (lang === 'java') {
-          // Extract enclosingFunctionId from sourceId (format: "Method:filePath:className:methodName" or "File:filePath")
-          const enclosingFunctionId = effectiveCall.sourceId.startsWith('Method:') ? effectiveCall.sourceId : null;
+        const javaCallSite: JavaCallSite = {
+          calledName: effectiveCall.calledName,
+          objectName: effectiveCall.receiverName || null,
+          objectTypeName: effectiveCall.receiverTypeName,  // Pre-extracted type
+          currentFile: effectiveCall.filePath,
+          enclosingFunctionId,
+        };
 
-          const javaCallSite: JavaCallSite = {
-            calledName: effectiveCall.calledName,
-            objectName: effectiveCall.receiverName || null,
-            currentFile: effectiveCall.filePath,
-            enclosingFunctionId,
+        const javaResult = resolveJavaCallTarget(javaCallSite, graph, ctx.symbols, ctx.importMap, null as any);
+        if (javaResult) {
+          resolved = {
+            nodeId: javaResult.nodeId,
+            confidence: javaResult.confidence,
+            reason: javaResult.reason,
+            filePath: javaResult.filePath,
+            returnType: javaResult.returnType,
           };
-
-          const javaResult = resolveJavaCallTarget(javaCallSite, graph, ctx.symbols, ctx.importMap, null as any);
-          if (javaResult) {
-            javaResolved = {
-              nodeId: javaResult.nodeId,
-              confidence: javaResult.confidence,
-              reason: javaResult.reason,
-              filePath: javaResult.filePath,
-              returnType: javaResult.returnType,
-            };
-          }
         }
       }
 
-      const finalResolved = resolved || javaResolved;
+      // Fallback to generic resolution for non-Java or when Java resolver fails
+      if (!resolved) {
+        resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx);
+      }
+
+      const finalResolved = resolved;
       if (!finalResolved) continue;
 
       const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${finalResolved.nodeId}`);
@@ -1382,10 +1376,8 @@ export const processCallsFromExtracted = async (
     ctx.clearCache();
   }
 
-  // Print Java resolver performance stats if tracking was enabled
-  if (process.env.GITNEXUS_DEBUG_JAVA) {
-    printJavaResolverStats();
-  }
+  // Print Java resolver performance stats (always show for production monitoring)
+  printJavaResolverStats();
 
   onProgress?.(totalFiles, totalFiles);
 };

@@ -608,7 +608,13 @@ export const runPipelineFromRepo = async (
     const allTfmCalls: import('./workers/parse-worker.js').ExtractedTfmCall[] = [];
     const allTfmServiceDefs: import('./workers/parse-worker.js').ExtractedTfmServiceDef[] = [];
 
+    // Phase 1 data accumulation: collect all chunk results before resolving calls
+    const allChunkData: Array<NonNullable<Awaited<ReturnType<typeof processParsing>>>> = [];
+
     try {
+      // ═══════════════════════════════════════════════════════════════════
+      // PHASE 1: Parse all chunks (symbols + imports + heritage)
+      // ═══════════════════════════════════════════════════════════════════
       for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
         const chunkPaths = chunks[chunkIdx];
 
@@ -639,6 +645,9 @@ export const runPipelineFromRepo = async (
         const chunkBasePercent = 20 + ((filesParsedSoFar / totalParseable) * 62);
 
         if (chunkWorkerData) {
+          // Store for Phase 2 processing
+          allChunkData.push(chunkWorkerData);
+
           // Imports
           await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, ctx, (current, total) => {
             onProgress({
@@ -654,71 +663,23 @@ export const runPipelineFromRepo = async (
           // moduleAliasMap for Python namespace imports. Must run after imports are resolved
           // (importMap is populated) but BEFORE call resolution.
           if (chunkNeedsSynthesis[chunkIdx]) synthesizeWildcardImportBindings(graph, ctx);
-          // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
-          // before call resolution — eliminates re-parse for single-hop imported receivers.
-          // NOTE: In the worker path, exportedTypeMap is empty during chunk processing
-          // (populated later in runCrossFileBindingPropagation). This block is latent —
-          // it activates only if incremental export collection is added per-chunk.
-          if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
-            const { enrichedCount } = seedCrossFileReceiverTypes(
-              chunkWorkerData.calls, ctx.namedImportMap, exportedTypeMap,
-            );
-            if (isDev && enrichedCount > 0) {
-              console.log(`🔗 E1: Seeded ${enrichedCount} cross-file receiver types (chunk ${chunkIdx + 1})`);
-            }
-          }
-          // Calls + Heritage + Routes — resolve in parallel (no shared mutable state between them)
-          // This is safe because each writes disjoint relationship types into idempotent id-keyed Maps,
-          // and the single-threaded event loop prevents races between synchronous addRelationship calls.
-          await Promise.all([
-            processCallsFromExtracted(
-              graph,
-              chunkWorkerData.calls,
-              ctx,
-              (current, total) => {
-                onProgress({
-                  phase: 'parsing',
-                  percent: Math.round(chunkBasePercent),
-                  message: `Resolving calls (chunk ${chunkIdx + 1}/${numChunks})...`,
-                  detail: `${current}/${total} files`,
-                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-                });
-              },
-              chunkWorkerData.constructorBindings,
-            ),
-            processHeritageFromExtracted(
-              graph,
-              chunkWorkerData.heritage,
-              ctx,
-              (current, total) => {
-                onProgress({
-                  phase: 'parsing',
-                  percent: Math.round(chunkBasePercent),
-                  message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
-                  detail: `${current}/${total} records`,
-                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-                });
-              },
-            ),
-            processRoutesFromExtracted(
-              graph,
-              chunkWorkerData.routes ?? [],
-              ctx,
-              (current, total) => {
-                onProgress({
-                  phase: 'parsing',
-                  percent: Math.round(chunkBasePercent),
-                  message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
-                  detail: `${current}/${total} routes`,
-                  stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-                });
-              },
-            ),
-          ]);
-          // Process field write assignments (synchronous, runs after calls resolve)
-          if (chunkWorkerData.assignments?.length) {
-            processAssignmentsFromExtracted(graph, chunkWorkerData.assignments, ctx, chunkWorkerData.constructorBindings);
-          }
+
+          // Heritage processing (must complete before call resolution for super-call support)
+          await processHeritageFromExtracted(
+            graph,
+            chunkWorkerData.heritage,
+            ctx,
+            (current, total) => {
+              onProgress({
+                phase: 'parsing',
+                percent: Math.round(chunkBasePercent),
+                message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
+                detail: `${current}/${total} records`,
+                stats: { filesProcessed: filesParsedSoFar, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+              });
+            },
+          );
+
           // Collect TypeEnv file-scope bindings for exported type enrichment
           if (chunkWorkerData.typeEnvBindings?.length) {
             workerTypeEnvBindings.push(...chunkWorkerData.typeEnvBindings);
@@ -751,7 +712,63 @@ export const runPipelineFromRepo = async (
 
         // Clear AST cache between chunks to free memory
         astCache.clear();
-        // chunkContents + chunkFiles + chunkWorkerData go out of scope → GC reclaims
+        // chunkContents + chunkFiles go out of scope → GC reclaims
+      }
+
+      // ═══════════════════════════════════════════════════════════════════
+      // PHASE 2: Resolve all calls (SymbolTable is now complete)
+      // ═══════════════════════════════════════════════════════════════════
+      for (let chunkIdx = 0; chunkIdx < allChunkData.length; chunkIdx++) {
+        const chunkWorkerData = allChunkData[chunkIdx];
+        const chunkBasePercent = 82 + ((chunkIdx / allChunkData.length) * 10);
+
+        // Phase 14 E1: Seed cross-file receiver types from ExportedTypeMap
+        if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
+          const { enrichedCount } = seedCrossFileReceiverTypes(
+            chunkWorkerData.calls, ctx.namedImportMap, exportedTypeMap,
+          );
+          if (isDev && enrichedCount > 0) {
+            console.log(`🔗 E1: Seeded ${enrichedCount} cross-file receiver types (chunk ${chunkIdx + 1})`);
+          }
+        }
+
+        // Resolve Calls + Routes in parallel (EXTENDS edges + SymbolTable both complete)
+        await Promise.all([
+          processCallsFromExtracted(
+            graph,
+            chunkWorkerData.calls,
+            ctx,
+            (current, total) => {
+              onProgress({
+                phase: 'parsing',
+                percent: Math.round(chunkBasePercent),
+                message: `Resolving calls (chunk ${chunkIdx + 1}/${allChunkData.length})...`,
+                detail: `${current}/${total} files`,
+                stats: { filesProcessed: totalParseable, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+              });
+            },
+            chunkWorkerData.constructorBindings,
+          ),
+          processRoutesFromExtracted(
+            graph,
+            chunkWorkerData.routes ?? [],
+            ctx,
+            (current, total) => {
+              onProgress({
+                phase: 'parsing',
+                percent: Math.round(chunkBasePercent),
+                message: `Resolving routes (chunk ${chunkIdx + 1}/${allChunkData.length})...`,
+                detail: `${current}/${total} routes`,
+                stats: { filesProcessed: totalParseable, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+              });
+            },
+          ),
+        ]);
+
+        // Process field write assignments (synchronous, runs after calls resolve)
+        if (chunkWorkerData.assignments?.length) {
+          processAssignmentsFromExtracted(graph, chunkWorkerData.assignments, ctx, chunkWorkerData.constructorBindings);
+        }
       }
     } finally {
       await workerPool?.terminate();
@@ -767,8 +784,9 @@ export const runPipelineFromRepo = async (
         .filter(p => chunkContents.has(p))
         .map(p => ({ path: p, content: chunkContents.get(p)! }));
       astCache = createASTCache(chunkFiles.length);
-      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx, undefined, exportedTypeMap);
+      // Process heritage first to ensure EXTENDS edges are available for Java super-call resolution
       await processHeritage(graph, chunkFiles, astCache, ctx);
+      const rubyHeritage = await processCalls(graph, chunkFiles, astCache, ctx, undefined, exportedTypeMap);
       if (rubyHeritage.length > 0) {
         await processHeritageFromExtracted(graph, rubyHeritage, ctx);
       }
