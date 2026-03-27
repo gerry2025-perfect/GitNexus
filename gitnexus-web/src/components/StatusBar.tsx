@@ -1,12 +1,16 @@
 import { useMemo } from 'react';
 import { Heart } from '@/lib/lucide-icons';
 import { useAppState } from '../hooks/useAppState';
+import { getServerModeConfig } from '../config/ui-constants';
 
 export const StatusBar = () => {
-  const { graph, progress } = useAppState();
+  const { graph, progress, serverBaseUrl } = useAppState();
 
   const nodeCount = graph?.nodes.length ?? 0;
   const edgeCount = graph?.relationships.length ?? 0;
+
+  // 获取当前查询模式配置（已在应用初始化时缓存）
+  const isLocalWasmMode = getServerModeConfig();
 
   // Detect primary language
   const primaryLanguage = useMemo(() => {
@@ -71,6 +75,22 @@ export const StatusBar = () => {
               <>
                 <span className="text-border-default">•</span>
                 <span>{primaryLanguage}</span>
+              </>
+            )}
+            {serverBaseUrl && (
+              <>
+                <span className="text-border-default">•</span>
+                <span
+                  className="flex items-center gap-1.5"
+                  title={
+                    isLocalWasmMode
+                      ? '使用浏览器内数据库（适合小型项目）'
+                      : '使用服务器查询（适合大型项目）'
+                  }
+                >
+                  <span className={`w-1.5 h-1.5 rounded-full ${isLocalWasmMode ? 'bg-blue-500' : 'bg-green-500'}`} />
+                  <span>{isLocalWasmMode ? 'Local WASM' : 'Server API'}</span>
+                </span>
               </>
             )}
           </>

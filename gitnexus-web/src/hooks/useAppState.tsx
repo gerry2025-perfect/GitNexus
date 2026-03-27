@@ -12,7 +12,7 @@ import type { AgentMessage } from '../core/llm/agent';
 import { type EdgeType } from '../lib/constants';
 import type { RepoSummary, ConnectToServerResult } from '../services/server-connection';
 import { fetchRepos, connectToServer } from '../services/server-connection';
-import { ERROR_RESET_DELAY_MS } from '../config/ui-constants';
+import { ERROR_RESET_DELAY_MS, getServerModeConfig } from '../config/ui-constants';
 import { normalizePath, resolveFilePath as resolvePathFromContents } from '../lib/path-resolution';
 import { FILE_REF_REGEX, NODE_REF_REGEX } from '../lib/grounding-patterns';
 import { GraphStateProvider, useGraphState } from './app-state/graph';
@@ -124,6 +124,8 @@ interface AppState {
   setServerBaseUrl: (url: string | null) => void;
   availableRepos: RepoSummary[];
   setAvailableRepos: (repos: RepoSummary[]) => void;
+  currentRepoName: string;
+  setCurrentRepoName: (name: string) => void;
   switchRepo: (repoName: string) => Promise<void>;
 
   // Worker API (shared across app)
@@ -164,6 +166,8 @@ interface AppState {
   // LLM methods
   refreshLLMSettings: () => void;
   initializeAgent: (overrideProjectName?: string) => Promise<void>;
+  initializeBackendAgent: (serverUrl: string, repo: string, fileContents: Map<string, string>, projectName: string) => Promise<void>;
+  setServerConnection: (serverUrl: string, repo: string) => Promise<void>;
   sendChatMessage: (message: string) => Promise<void>;
   stopChatResponse: () => void;
   clearChat: () => void;
@@ -303,6 +307,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
   // Multi-repo switching
   const [serverBaseUrl, setServerBaseUrl] = useState<string | null>(null);
   const [availableRepos, setAvailableRepos] = useState<RepoSummary[]>([]);
+  const [currentRepoName, setCurrentRepoName] = useState<string>('');
 
   // Embedding state
   const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus>('idle');
@@ -623,6 +628,72 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       setIsAgentInitializing(false);
     }
   }, [projectName]);
+
+  /**
+   * Initialize agent in backend mode (HTTP-backed queries).
+   * Uses server API endpoints instead of local WASM database.
+   */
+  const initializeBackendAgent = useCallback(async (
+    serverUrl: string,
+    repo: string,
+    fileContents: Map<string, string>,
+    projectName: string
+  ): Promise<void> => {
+    const api = apiRef.current;
+    if (!api) {
+      setAgentError('Worker not initialized');
+      return;
+    }
+
+    const config = getActiveProviderConfig();
+    if (!config) {
+      setAgentError('Please configure an LLM provider in settings');
+      return;
+    }
+
+    setIsAgentInitializing(true);
+    setAgentError(null);
+
+    try {
+      // Convert Map to entries array (Comlink can't transfer Maps)
+      const fileContentsEntries: [string, string][] = Array.from(fileContents.entries());
+
+      const result = await api.initializeBackendAgent(
+        config,
+        serverUrl,
+        repo,
+        fileContentsEntries,
+        projectName
+      );
+
+      if (result.success) {
+        setIsAgentReady(true);
+        setAgentError(null);
+        if (import.meta.env.DEV) {
+          console.log('✅ Backend agent initialized successfully');
+        }
+      } else {
+        setAgentError(result.error ?? 'Failed to initialize backend agent');
+        setIsAgentReady(false);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setAgentError(message);
+      setIsAgentReady(false);
+    } finally {
+      setIsAgentInitializing(false);
+    }
+  }, []);
+
+  /**
+   * Set server connection for query routing (independent of agent)
+   */
+  const setServerConnection = useCallback(async (serverUrl: string, repo: string): Promise<void> => {
+    const api = apiRef.current;
+    if (!api) return;
+
+    api.setServerConnection(serverUrl, repo);
+  }, []);
 
   const sendChatMessage = useCallback(async (message: string): Promise<void> => {
     const api = apiRef.current;
@@ -1038,6 +1109,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       const repoPath = result.repoInfo.repoPath;
       const pName = repoName || result.repoInfo.name || repoPath.split('/').pop() || 'server-project';
       setProjectName(pName);
+      setCurrentRepoName(repoName);
 
       const graph = createKnowledgeGraph();
       for (const node of result.nodes) graph.addNode(node);
@@ -1048,14 +1120,40 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       for (const [p, c] of Object.entries(result.fileContents)) fileMap.set(p, c);
       setFileContents(fileMap);
 
-      // Load graph into LadybugDB for Nexus AI queries, then init agent
+      // === 关键改造点 ===
+      // 从 URL 参数或配置决定是否加载到本地 WASM
+      const shouldLoadToLocalWasm = getServerModeConfig();
+
+      // Load graph and initialize agent based on mode
       try {
-        await loadServerGraph(result.nodes, result.relationships, result.fileContents);
-        if (getActiveProviderConfig()) {
-          await initializeAgent(pName);
+        if (shouldLoadToLocalWasm) {
+          // 兼容模式：加载到本地 WASM
+          await loadServerGraph(result.nodes, result.relationships, result.fileContents);
+          if (getActiveProviderConfig()) {
+            await initializeAgent(pName);
+          }
+          setViewMode('exploring');
+          startEmbeddingsWithFallback();
+        } else {
+          // 纯服务器模式：使用 HTTP 查询
+          // 首先设置服务器连接信息
+          await setServerConnection(serverBaseUrl, repoName);
+
+          // 如果有 LLM provider，初始化 AI agent
+          const config = getActiveProviderConfig();
+          if (config) {
+            await initializeBackendAgent(
+              serverBaseUrl,
+              repoName,
+              fileMap,
+              pName
+            );
+          } else {
+            console.log('ℹ️ No LLM provider configured, AI features disabled (Cypher queries still work)');
+          }
+          setViewMode('exploring');
+          // 注意：服务器模式下不启动本地 embeddings
         }
-        setViewMode('exploring');
-        startEmbeddingsWithFallback();
         setProgress(null);
       } catch (err) {
         console.warn('Failed to load graph into LadybugDB:', err);
@@ -1076,7 +1174,7 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
       await apiRef.current?.disposeAgent();
       setTimeout(() => { setViewMode('exploring'); setProgress(null); }, ERROR_RESET_DELAY_MS);
     }
-  }, [serverBaseUrl, setProgress, setViewMode, setProjectName, setGraph, setFileContents, loadServerGraph, initializeAgent, startEmbeddingsWithFallback, setHighlightedNodeIds, clearAIToolHighlights, clearAICitationHighlights, clearBlastRadius, setSelectedNode, setQueryResult, setCodeReferences, setCodePanelOpen, setCodeReferenceFocus]);
+  }, [serverBaseUrl, setProgress, setViewMode, setProjectName, setCurrentRepoName, setGraph, setFileContents, loadServerGraph, initializeAgent, initializeBackendAgent, setServerConnection, startEmbeddingsWithFallback, setHighlightedNodeIds, clearAIToolHighlights, clearAICitationHighlights, clearBlastRadius, setSelectedNode, setQueryResult, setCodeReferences, setCodePanelOpen, setCodeReferenceFocus]);
 
   const removeCodeReference = useCallback((id: string) => {
     setCodeReferences(prev => {
@@ -1159,6 +1257,8 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     setServerBaseUrl,
     availableRepos,
     setAvailableRepos,
+    currentRepoName,
+    setCurrentRepoName,
     switchRepo,
     runPipeline,
     runPipelineFromFiles,
@@ -1190,6 +1290,8 @@ const AppStateProviderInner = ({ children }: { children: ReactNode }) => {
     // LLM methods
     refreshLLMSettings,
     initializeAgent,
+    initializeBackendAgent,
+    setServerConnection,
     sendChatMessage,
     stopChatResponse,
     clearChat,

@@ -41,6 +41,10 @@ const getLbugAdapter = async () => {
 let embeddingProgress: EmbeddingProgress | null = null;
 let isEmbeddingComplete = false;
 
+// Server query mode state (for backend HTTP mode)
+let serverBackendUrl: string | null = null;
+let serverRepoName: string | null = null;
+
 /**
  * Shared post-pipeline logic: store results, build BM25 index, load LadybugDB,
  * and queue enrichment config. Used by both runPipeline and runPipelineFromFiles.
@@ -131,7 +135,7 @@ const httpFetchWithTimeout = async (
 
 const createHttpExecuteQuery = (backendUrl: string, repo: string) => {
   return async (cypher: string): Promise<any[]> => {
-    const response = await httpFetchWithTimeout(`${backendUrl}/api/query`, {
+    const response = await httpFetchWithTimeout(`${backendUrl}/query`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ cypher, repo }),
@@ -154,7 +158,7 @@ const createHttpExecuteQuery = (backendUrl: string, repo: string) => {
 const createHttpHybridSearch = (backendUrl: string, repo: string) => {
   return async (query: string, k: number = 15): Promise<any[]> => {
     try {
-      const response = await httpFetchWithTimeout(`${backendUrl}/api/search`, {
+      const response = await httpFetchWithTimeout(`${backendUrl}/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query, limit: k, repo }),
@@ -228,6 +232,10 @@ const workerApi = {
     relationships: GraphRelationship[],
     fileContents: Record<string, string>
   ): Promise<void> {
+    // Clear server query mode when loading to local WASM
+    serverBackendUrl = null;
+    serverRepoName = null;
+
     const graph = createKnowledgeGraph();
     for (const node of nodes) graph.addNode(node);
     for (const rel of relationships) graph.addRelationship(rel);
@@ -268,28 +276,54 @@ const workerApi = {
   },
 
   /**
-   * Execute a Cypher query against the LadybugDB database
-   * @param cypher - The Cypher query string
-   * @returns Query results as an array of objects
+   * Check if the database is ready for queries
+   * In server mode, always returns true
+   */
+  async isReady(): Promise<boolean> {
+    console.log('🔍 isReady check:', { serverBackendUrl, serverRepoName });
+
+    // Server mode: no local database needed
+    if (serverBackendUrl && serverRepoName) {
+      console.log('✅ Server mode: database ready');
+      return true;
+    }
+
+    // Local mode: check WASM database
+    try {
+      const lbug = await getLbugAdapter();
+      const ready = lbug.isLbugReady();
+      console.log('🔍 Local mode: database ready =', ready);
+      return ready;
+    } catch {
+      console.log('❌ Local mode: database error');
+      return false;
+    }
+  },
+
+  /**
+   * Execute a query (routes to server or local based on mode)
    */
   async runQuery(cypher: string): Promise<any[]> {
+    console.log('🔍 runQuery:', {
+      serverBackendUrl,
+      serverRepoName,
+      mode: serverBackendUrl ? 'Server API' : 'Local WASM'
+    });
+
+    // Server mode: use HTTP query
+    if (serverBackendUrl && serverRepoName) {
+      console.log('📡 Executing via HTTP:', serverBackendUrl);
+      const executeQuery = createHttpExecuteQuery(serverBackendUrl, serverRepoName);
+      return executeQuery(cypher);
+    }
+
+    // Local mode: use WASM database
+    console.log('💾 Executing via local WASM');
     const lbug = await getLbugAdapter();
     if (!lbug.isLbugReady()) {
       throw new Error('Database not ready. Please load a repository first.');
     }
     return lbug.executeQuery(cypher);
-  },
-
-  /**
-   * Check if the database is ready for queries
-   */
-  async isReady(): Promise<boolean> {
-    try {
-      const lbug = await getLbugAdapter();
-      return lbug.isLbugReady();
-    } catch {
-      return false;
-    }
   },
 
   /**
@@ -664,6 +698,14 @@ const workerApi = {
     projectName?: string,
   ): Promise<{ success: boolean; error?: string }> {
     try {
+      console.log('🚀 initializeBackendAgent called:', { backendUrl, repoName, projectName });
+
+      // Save server connection info for query routing
+      serverBackendUrl = backendUrl;
+      serverRepoName = repoName;
+
+      console.log('✅ Server connection info saved:', { serverBackendUrl, serverRepoName });
+
       // Rebuild Map from serializable entries (Comlink can't transfer Maps)
       const contents = new Map<string, string>(fileContentsEntries);
       storedFileContents = contents;
@@ -716,6 +758,26 @@ const workerApi = {
    */
   isAgentReady(): boolean {
     return currentAgent !== null;
+  },
+
+  /**
+   * Set server connection info for query routing (independent of agent)
+   * This allows Cypher queries to work in server mode even without an LLM provider
+   */
+  setServerConnection(backendUrl: string, repoName: string): void {
+    console.log('🔗 Setting server connection:', { backendUrl, repoName });
+    serverBackendUrl = backendUrl;
+    serverRepoName = repoName;
+    console.log('✅ Server connection configured for query routing');
+  },
+
+  /**
+   * Clear server connection (switch back to local mode)
+   */
+  clearServerConnection(): void {
+    console.log('🔗 Clearing server connection');
+    serverBackendUrl = null;
+    serverRepoName = null;
   },
 
   /**

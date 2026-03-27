@@ -13,7 +13,7 @@ import { FileEntry } from './services/zip';
 import { getActiveProviderConfig } from './core/llm/settings-service';
 import { createKnowledgeGraph } from './core/graph/graph';
 import { connectToServer, fetchRepos, normalizeServerUrl, type ConnectToServerResult } from './services/server-connection';
-import { ERROR_RESET_DELAY_MS } from './config/ui-constants';
+import { ERROR_RESET_DELAY_MS, getServerModeConfig } from './config/ui-constants';
 
 const AppContent = () => {
   const {
@@ -31,6 +31,8 @@ const AppContent = () => {
     setSettingsPanelOpen,
     refreshLLMSettings,
     initializeAgent,
+    initializeBackendAgent,
+    setServerConnection,
     startEmbeddingsWithFallback,
     embeddingStatus,
     codeReferences,
@@ -40,8 +42,12 @@ const AppContent = () => {
     setServerBaseUrl,
     availableRepos,
     setAvailableRepos,
+    currentRepoName,
+    setCurrentRepoName,
     switchRepo,
     loadServerGraph,
+    fileContents,
+    projectName,
   } = useAppState();
 
   const graphCanvasRef = useRef<GraphCanvasHandle>(null);
@@ -125,12 +131,13 @@ const AppContent = () => {
     }
   }, [setViewMode, setGraph, setFileContents, setProgress, setProjectName, runPipelineFromFiles, startEmbeddingsWithFallback, initializeAgent]);
 
-  const handleServerConnect = useCallback((result: ConnectToServerResult): Promise<void> => {
+  const handleServerConnect = useCallback((result: ConnectToServerResult, serverBaseUrl: string): Promise<void> => {
     // Extract project name from repoPath
     const repoPath = result.repoInfo.repoPath;
     const parts = repoPath.split('/').filter(p => p && !p.startsWith('.'));
     const projectName = parts[parts.length - 1] || parts[0] || 'server-project';
     setProjectName(projectName);
+    setCurrentRepoName(result.repoInfo.name);
 
     // Build KnowledgeGraph from server data for visualization
     const graph = createKnowledgeGraph();
@@ -152,24 +159,64 @@ const AppContent = () => {
     // Transition directly to exploring view
     setViewMode('exploring');
 
-    // Load graph into LadybugDB (in-browser WASM database) for Nexus AI queries,
-    // then initialize agent once the database is ready
-    const loadGraphPromise = loadServerGraph(result.nodes, result.relationships, result.fileContents)
-      .then(() => {
-        if (getActiveProviderConfig()) {
-          return initializeAgent(projectName);
-        }
-      })
-      .then(() => {
-        startEmbeddingsWithFallback();
-      })
-      .catch((err) => {
-        console.warn('Failed to load graph into LadybugDB:', err);
-        // Agent won't work but graph visualization still does
-      });
+    // === 关键改造点 ===
+    // 从 URL 参数或配置决定是否加载到本地 WASM
+    const shouldLoadToLocalWasm = getServerModeConfig();
+
+    let loadGraphPromise: Promise<void>;
+
+    if (shouldLoadToLocalWasm) {
+      // 兼容模式：加载图到本地 LadybugDB WASM，后续查询在本地执行
+      // 适合小型项目（<1000 符号），无网络延迟
+      loadGraphPromise = loadServerGraph(result.nodes, result.relationships, result.fileContents)
+        .then(() => {
+          if (getActiveProviderConfig()) {
+            return initializeAgent(projectName);
+          }
+        })
+        .then(() => {
+          startEmbeddingsWithFallback();
+        })
+        .catch((err) => {
+          console.warn('Failed to load graph into LadybugDB:', err);
+          // Agent won't work but graph visualization still does
+        });
+    } else {
+      // 纯服务器模式：所有查询通过 HTTP API 执行
+      // 适合大型项目（>5000 符号），内存占用低，初始化快
+      loadGraphPromise = Promise.resolve()
+        .then(() => {
+          // 首先设置服务器连接信息，确保查询可以路由到服务器
+          return setServerConnection(serverBaseUrl, result.repoInfo.name);
+        })
+        .then(() => {
+          // 如果有 LLM provider，初始化 AI agent
+          const config = getActiveProviderConfig();
+          if (config) {
+            return initializeBackendAgent(
+              serverBaseUrl,
+              result.repoInfo.name,
+              fileMap,
+              projectName
+            );
+          } else {
+            console.log('ℹ️ No LLM provider configured, AI features disabled (Cypher queries still work)');
+          }
+        })
+        .then(() => {
+          // 注意：服务器模式下不启动本地 embeddings（服务器端已有）
+          if (import.meta.env.DEV) {
+            console.log('✅ Server mode: Using HTTP-backed queries');
+          }
+        })
+        .catch((err) => {
+          console.error('Failed to initialize server mode:', err);
+          // Agent won't work but graph visualization and queries still work
+        });
+    }
 
     return loadGraphPromise;
-  }, [setViewMode, setGraph, setFileContents, setProjectName, loadServerGraph, initializeAgent, startEmbeddingsWithFallback]);
+  }, [setViewMode, setGraph, setFileContents, setProjectName, setCurrentRepoName, loadServerGraph, initializeAgent, initializeBackendAgent, setServerConnection, startEmbeddingsWithFallback]);
 
   // Auto-connect when ?server query param is present (bookmarkable shortcut)
   const autoConnectRan = useRef(false);
@@ -179,8 +226,12 @@ const AppContent = () => {
     if (!params.has('server')) return;
     autoConnectRan.current = true;
 
-    // Clean the URL so a refresh won't re-trigger
-    const cleanUrl = window.location.pathname + window.location.hash;
+    // 保留 localWasm 参数（如果存在），其他参数清理
+    // 这样用户刷新页面时可以保持相同的查询模式
+    const localWasmParam = params.get('localWasm');
+    const cleanUrl = window.location.pathname +
+      (localWasmParam !== null ? `?localWasm=${localWasmParam}` : '') +
+      window.location.hash;
     window.history.replaceState(null, '', cleanUrl);
 
     setProgress({ phase: 'extracting', percent: 0, message: 'Connecting to server...', detail: 'Validating server' });
@@ -201,7 +252,7 @@ const AppContent = () => {
         setProgress({ phase: 'extracting', percent: 97, message: 'Processing...', detail: 'Extracting file contents' });
       }
     }).then(async (result) => {
-      await handleServerConnect(result);
+      await handleServerConnect(result, baseUrl);
       setProgress(null);
       setServerBaseUrl(baseUrl);
       fetchRepos(baseUrl)
@@ -230,8 +281,22 @@ const AppContent = () => {
   // NOTE: Must be defined BEFORE any conditional returns (React hooks rule)
   const handleSettingsSaved = useCallback(() => {
     refreshLLMSettings();
-    initializeAgent();
-  }, [refreshLLMSettings, initializeAgent]);
+
+    // Reinitialize agent based on current mode
+    const isServerMode = getServerModeConfig();
+
+    if (serverBaseUrl && !isServerMode) {
+      // Server mode with localWasm=false - need to use backend agent
+      if (currentRepoName && fileContents.size > 0) {
+        initializeBackendAgent(serverBaseUrl, currentRepoName, fileContents, projectName);
+      } else {
+        console.log('⚠️ Cannot initialize backend agent: missing repo info or file contents');
+      }
+    } else {
+      // Local mode or server with localWasm=true - use local agent
+      initializeAgent();
+    }
+  }, [refreshLLMSettings, initializeAgent, initializeBackendAgent, serverBaseUrl, currentRepoName, fileContents, projectName]);
 
   // Render based on view mode
   if (viewMode === 'onboarding') {
@@ -240,10 +305,10 @@ const AppContent = () => {
         onFileSelect={handleFileSelect}
         onGitClone={handleGitClone}
         onServerConnect={async (result, serverUrl) => {
-          await handleServerConnect(result);
+          const baseUrl = normalizeServerUrl(serverUrl || window.location.origin);
+          await handleServerConnect(result, baseUrl);
           setProgress(null);
           if (serverUrl) {
-            const baseUrl = normalizeServerUrl(serverUrl);
             setServerBaseUrl(baseUrl);
             fetchRepos(baseUrl)
               .then((repos) => setAvailableRepos(repos))
